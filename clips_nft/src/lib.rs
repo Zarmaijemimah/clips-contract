@@ -1234,6 +1234,57 @@ impl ClipsNftContract {
         Ok(())
     }
 
+    /// Admin-led transfer that may move a soulbound token between owners.
+    ///
+    /// ⚠️ **Access Control: Admin only.** This entrypoint bypasses the
+    /// `is_soulbound` transfer restriction so the admin can recover or migrate
+    /// tokens in exceptional cases (e.g. lost keys). It still requires the
+    /// supplied `from` to match the current owner.
+    pub fn admin_transfer_soulbound(
+        env: Env,
+        admin: Address,
+        from: Address,
+        to: Address,
+        token_id: TokenId,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+
+        let mut data: TokenData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Token(token_id))
+            .ok_or(Error::InvalidTokenId)?;
+
+        if from != data.owner {
+            return Err(Error::Unauthorized);
+        }
+
+        // Clear per-token approval on transfer.
+        env.storage().persistent().remove(&DataKey::Approved(token_id));
+
+        data.owner = to.clone();
+        env.storage().persistent().set(&DataKey::Token(token_id), &data);
+
+        // Update balances
+        let from_balance: u32 = env.storage().persistent().get(&DataKey::Balance(from.clone())).unwrap_or(0);
+        env.storage().persistent().set(&DataKey::Balance(from.clone()), &from_balance.saturating_sub(1));
+        let to_balance: u32 = env.storage().persistent().get(&DataKey::Balance(to.clone())).unwrap_or(0);
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(to_balance + 1));
+
+        env.events().publish(
+            (symbol_short!("transfer"),),
+            TransferEvent { token_id, from, to },
+        );
+
+        // Gas tracking
+        let count_transfer: u64 = env.storage().instance().get(&DataKey::CountTransfer).unwrap_or(0);
+        env.storage().instance().set(&DataKey::CountTransfer, &(count_transfer + 1));
+        let total_gas_transfer: u64 = env.storage().instance().get(&DataKey::TotalGasTransfer).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalGasTransfer, &total_gas_transfer.saturating_add(GAS_BASE_TRANSFER));
+
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // Admin configuration  ⚠️ PRIVILEGED — admin only
     // -------------------------------------------------------------------------
