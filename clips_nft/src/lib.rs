@@ -83,6 +83,9 @@ use soroban_sdk::{
 /// Contract version — bump on every breaking change.
 pub const VERSION: u32 = 1;
 pub const DEFAULT_MINT_COOLDOWN_SECONDS: u64 = 0;
+pub const DEFAULT_CIRCUIT_BREAKER_ENABLED: bool = false;
+pub const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u64 = 100;
+pub const DEFAULT_CIRCUIT_BREAKER_WINDOW_SECONDS: u64 = 60;
 
 // =============================================================================
 // Errors
@@ -140,6 +143,8 @@ pub enum Error {
     MintCooldownActive = 23,
     /// Reentrant call detected while a guarded entrypoint is executing.
     Reentrancy = 24,
+    /// Circuit breaker triggered due to anomalous mint activity.
+    CircuitBreakerTripped = 25,
 }
 
 // =============================================================================
@@ -323,6 +328,16 @@ pub enum DataKey {
     MintCooldownSeconds,
     /// Reentrancy guard for external token calls (instance).
     ReentrancyLock,
+    /// Circuit breaker enabled flag (instance).
+    CircuitBreakerEnabled,
+    /// Circuit breaker: max mints allowed in time window (instance).
+    CircuitBreakerThreshold,
+    /// Circuit breaker: time window duration in seconds (instance).
+    CircuitBreakerWindowSeconds,
+    /// Circuit breaker: start timestamp of current window (instance).
+    CircuitBreakerWindowStart,
+    /// Circuit breaker: mint count in current window (instance).
+    CircuitBreakerWindowCount,
 }
 
 /// Emergency withdrawal request
@@ -529,6 +544,15 @@ pub struct AdminChangedEvent {
     pub new_admin: Address,
 }
 
+/// Emitted when the circuit breaker is triggered automatically.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerTriggeredEvent {
+    pub mint_count: u64,
+    pub threshold: u64,
+    pub window_seconds: u64,
+}
+
 
 /// Emerging Soroban NFT standard interface (ERC-721 adapted).
 /// Documents the expected API surface for marketplace interoperability.
@@ -604,6 +628,22 @@ impl ClipsNftContract {
         env.storage()
             .instance()
             .set(&DataKey::MintCooldownSeconds, &DEFAULT_MINT_COOLDOWN_SECONDS);
+        // Initialize circuit breaker with default values
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerEnabled, &DEFAULT_CIRCUIT_BREAKER_ENABLED);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerThreshold, &DEFAULT_CIRCUIT_BREAKER_THRESHOLD);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerWindowSeconds, &DEFAULT_CIRCUIT_BREAKER_WINDOW_SECONDS);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerWindowStart, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerWindowCount, &0u64);
         // Signer is not set at init — call set_signer before minting.
     }
 
@@ -938,6 +978,7 @@ impl ClipsNftContract {
         to.require_auth();
         Self::require_not_paused(&env)?;
         Self::enforce_mint_cooldown(&env, &to)?;
+        Self::check_circuit_breaker(&env, 1)?;
 
         // Validate URLs before any state reads/writes.
         Self::validate_url(&env, &image, Error::InvalidImageUrl)?;
@@ -1025,6 +1066,9 @@ impl ClipsNftContract {
         let total_gas_mint: u64 = env.storage().instance().get(&DataKey::TotalGasMint).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalGasMint, &total_gas_mint.saturating_add(GAS_BASE_MINT));
         Self::record_mint_timestamp(&env, &to);
+
+        // Update circuit breaker counter after successful mint
+        Self::update_circuit_breaker_counter(&env, 1);
 
         Ok(token_id)
     }
@@ -1388,6 +1432,64 @@ impl ClipsNftContract {
             .instance()
             .get(&DataKey::MintCooldownSeconds)
             .unwrap_or(DEFAULT_MINT_COOLDOWN_SECONDS)
+    }
+
+    /// Set circuit breaker enabled status.
+    ///
+    /// ⚠️ **Access Control: Admin only.**
+    ///
+    /// When enabled, the circuit breaker will automatically pause the contract
+    /// if mint operations exceed the configured threshold within the time window.
+    ///
+    /// # Arguments
+    /// * `admin`   — Must be the contract admin.
+    /// * `enabled` — Whether to enable the circuit breaker.
+    pub fn set_circuit_breaker_enabled(env: Env, admin: Address, enabled: bool) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::CircuitBreakerEnabled, &enabled);
+        Ok(())
+    }
+
+    /// Set circuit breaker threshold (max mints allowed in time window).
+    ///
+    /// ⚠️ **Access Control: Admin only.**
+    ///
+    /// # Arguments
+    /// * `admin`     — Must be the contract admin.
+    /// * `threshold` — Maximum number of mints allowed in the time window.
+    pub fn set_circuit_breaker_threshold(env: Env, admin: Address, threshold: u64) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::CircuitBreakerThreshold, &threshold);
+        Ok(())
+    }
+
+    /// Set circuit breaker time window duration in seconds.
+    ///
+    /// ⚠️ **Access Control: Admin only.**
+    ///
+    /// # Arguments
+    /// * `admin`          — Must be the contract admin.
+    /// * `window_seconds` — Duration of the time window in seconds.
+    pub fn set_circuit_breaker_window(env: Env, admin: Address, window_seconds: u64) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::CircuitBreakerWindowSeconds, &window_seconds);
+        Ok(())
+    }
+
+    /// Reset circuit breaker window and counter.
+    ///
+    /// ⚠️ **Access Control: Admin only.**
+    ///
+    /// Useful for resetting the circuit breaker after a false alarm or
+    /// after the contract has been unpaused.
+    ///
+    /// # Arguments
+    /// * `admin` — Must be the contract admin.
+    pub fn reset_circuit_breaker(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::CircuitBreakerWindowStart, &0u64);
+        env.storage().instance().set(&DataKey::CircuitBreakerWindowCount, &0u64);
+        Ok(())
     }
 
     /// Update metadata URI for a token. Only the token owner can update it.
@@ -1827,6 +1929,46 @@ impl ClipsNftContract {
             .unwrap_or(0)
     }
 
+    /// Returns whether the circuit breaker is enabled.
+    pub fn circuit_breaker_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerEnabled)
+            .unwrap_or(DEFAULT_CIRCUIT_BREAKER_ENABLED)
+    }
+
+    /// Returns the circuit breaker threshold (max mints per window).
+    pub fn circuit_breaker_threshold(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerThreshold)
+            .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD)
+    }
+
+    /// Returns the circuit breaker time window duration in seconds.
+    pub fn circuit_breaker_window_seconds(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerWindowSeconds)
+            .unwrap_or(DEFAULT_CIRCUIT_BREAKER_WINDOW_SECONDS)
+    }
+
+    /// Returns the current circuit breaker window start timestamp.
+    pub fn circuit_breaker_window_start(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerWindowStart)
+            .unwrap_or(0)
+    }
+
+    /// Returns the current circuit breaker window mint count.
+    pub fn circuit_breaker_window_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerWindowCount)
+            .unwrap_or(0)
+    }
+
     /// Returns the number of tokens owned by `owner`.
     /// Compliant with emerging Soroban NFT standard view functions.
     pub fn balance_of(env: Env, owner: Address) -> u32 {
@@ -2008,6 +2150,7 @@ impl ClipsNftContract {
     }
 
     /// Internal royalty payout logic (caller must hold reentrancy lock).
+    /// Follows check-effects-interactions pattern: updates storage before external transfers.
     fn pay_royalty_internal(
         env: &Env,
         payer: &Address,
@@ -2020,8 +2163,33 @@ impl ClipsNftContract {
 
         let royalty = Self::load_token(env, token_id)?.royalty;
         let asset_address = royalty.asset_address.clone().ok_or(Error::InvalidRecipient)?;
-        let token_client = soroban_sdk::token::TokenClient::new(env, &asset_address);
 
+        // First, calculate total royalty amount (check phase)
+        let mut cumulative_bps: u32 = 0;
+        let mut cumulative_royalty: i128 = 0;
+
+        for idx in 0..royalty.recipients.len() {
+            let split = royalty.recipients.get(idx).ok_or(Error::InvalidRoyaltySplit)?;
+            cumulative_bps = cumulative_bps.saturating_add(split.basis_points);
+            let total_so_far = Self::calculate_royalty(sale_price, cumulative_bps)?;
+            cumulative_royalty = total_so_far;
+        }
+
+        // Update storage before external transfers (effects phase)
+        // This ensures state changes are committed before any external calls
+        if cumulative_royalty > 0 {
+            let prev: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RoyaltyBalance(token_id))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::RoyaltyBalance(token_id), &(prev.saturating_add(cumulative_royalty)));
+        }
+
+        // Now perform external transfers (interactions phase)
+        let token_client = soroban_sdk::token::TokenClient::new(env, &asset_address);
         let mut cumulative_bps: u32 = 0;
         let mut cumulative_royalty: i128 = 0;
 
@@ -2047,18 +2215,6 @@ impl ClipsNftContract {
                     amount,
                 },
             );
-        }
-
-        // Accrue total royalty paid to the token's claimable balance.
-        if cumulative_royalty > 0 {
-            let prev: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::RoyaltyBalance(token_id))
-                .unwrap_or(0);
-            env.storage()
-                .persistent()
-                .set(&DataKey::RoyaltyBalance(token_id), &(prev.saturating_add(cumulative_royalty)));
         }
 
         Ok(())
@@ -2310,9 +2466,9 @@ impl ClipsNftContract {
     // Task 1 (Issue #124): tokens_of_owner view
     // -------------------------------------------------------------------------
 
-    /// Return all token IDs owned by `owner`.
+    /// Return token IDs owned by `owner` with pagination support.
     ///
-    /// This function enables frontends to display all NFTs owned by a user.
+    /// This function enables frontends to display NFTs owned by a user with pagination.
     /// It iterates over minted token IDs (1..=next_token_id-1) and collects those
     /// whose owner matches.
     ///
@@ -2324,15 +2480,24 @@ impl ClipsNftContract {
     /// ## Gas Protection
     /// - Result is capped at MAX_RESULTS (1000) entries to prevent gas explosion
     /// - When result reaches 1000, iteration stops even if more tokens exist
-    /// - Callers should use pagination or alternative queries for larger result sets
+    /// - Pagination allows fetching large collections in batches
     ///
     /// # Arguments
     /// * `owner` - Address to query
+    /// * `limit` - Maximum number of results to return (optional, defaults to 1000)
+    /// * `offset` - Number of results to skip (optional, defaults to 0)
     ///
     /// # Returns
-    /// Vec of token IDs owned by the address, capped at 1000 entries
-    pub fn tokens_of_owner(env: Env, owner: Address) -> Vec<TokenId> {
+    /// Vec of token IDs owned by the address, respecting limit and offset
+    pub fn tokens_of_owner(
+        env: Env,
+        owner: Address,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Vec<TokenId> {
         const MAX_RESULTS: u32 = 1000;
+        let limit = limit.unwrap_or(MAX_RESULTS).min(MAX_RESULTS);
+        let offset = offset.unwrap_or(0);
         let next_id: u32 = env
             .storage()
             .instance()
@@ -2341,17 +2506,22 @@ impl ClipsNftContract {
 
         let mut result: Vec<TokenId> = Vec::new(&env);
         let mut count: u32 = 0;
+        let mut skipped: u32 = 0;
 
         let mut token_id: u32 = 1;
-        while token_id < next_id && count < MAX_RESULTS {
+        while token_id < next_id && count < limit {
             if let Some(data) = env
                 .storage()
                 .persistent()
                 .get::<DataKey, TokenData>(&DataKey::Token(token_id))
             {
                 if data.owner == owner {
-                    result.push_back(token_id);
-                    count += 1;
+                    if skipped < offset {
+                        skipped += 1;
+                    } else {
+                        result.push_back(token_id);
+                        count += 1;
+                    }
                 }
             }
             token_id += 1;
@@ -2448,13 +2618,11 @@ impl ClipsNftContract {
         Self::enforce_mint_cooldown(&env, &to)?;
 
         let n = clip_ids.len();
+        Self::check_circuit_breaker(&env, n as u64)?;
+
         if n != metadata_uris.len() || n != signatures.len() || n != images.len() || n != animation_urls.len() {
             return Err(Error::InvalidRoyaltySplit); // mismatched input lengths
         }
-        if n > MAX_BATCH_MINT {
-            return Err(Error::BatchTooLarge);
-        }
-
         if n > MAX_BATCH_MINT {
             return Err(Error::BatchTooLarge);
         }
@@ -2545,6 +2713,9 @@ impl ClipsNftContract {
         env.storage().instance().set(&DataKey::TotalGasMint, &total_gas_mint.saturating_add(GAS_BASE_MINT.saturating_mul(n as u64)));
         Self::record_mint_timestamp(&env, &to);
 
+        // Update circuit breaker counter after successful batch mint
+        Self::update_circuit_breaker_counter(&env, n as u64);
+
         Ok(minted)
     }
 
@@ -2578,6 +2749,132 @@ impl ClipsNftContract {
         }
 
         Self::calculate_royalty(sale_price, total_bps)
+    }
+
+    // -------------------------------------------------------------------------
+    // Circuit breaker internal helpers
+    // -------------------------------------------------------------------------
+
+    /// Check if the circuit breaker should trigger based on mint activity.
+    /// If enabled and the threshold is exceeded within the time window,
+    /// automatically pause the contract.
+    fn check_circuit_breaker(env: &Env, mint_count: u64) -> Result<(), Error> {
+        let enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerEnabled)
+            .unwrap_or(DEFAULT_CIRCUIT_BREAKER_ENABLED);
+        
+        if !enabled {
+            return Ok(());
+        }
+
+        let threshold: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerThreshold)
+            .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD);
+        
+        let window_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerWindowSeconds)
+            .unwrap_or(DEFAULT_CIRCUIT_BREAKER_WINDOW_SECONDS);
+
+        let now = env.ledger().timestamp();
+        let window_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerWindowStart)
+            .unwrap_or(0);
+        
+        let current_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerWindowCount)
+            .unwrap_or(0);
+
+        // Check if we need to reset the window (time elapsed)
+        if window_start == 0 || now >= window_start.saturating_add(window_seconds) {
+            // Window expired or not started - check if this batch alone would exceed threshold
+            if mint_count > threshold {
+                Self::trigger_circuit_breaker(env, mint_count, threshold, window_seconds)?;
+            }
+        } else {
+            // Within current window, check if adding this batch would exceed threshold
+            let new_count = current_count.saturating_add(mint_count);
+            if new_count > threshold {
+                Self::trigger_circuit_breaker(env, new_count, threshold, window_seconds)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update the circuit breaker counter after a successful mint.
+    fn update_circuit_breaker_counter(env: &Env, mint_count: u64) {
+        let enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerEnabled)
+            .unwrap_or(DEFAULT_CIRCUIT_BREAKER_ENABLED);
+        
+        if !enabled {
+            return;
+        }
+
+        let window_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerWindowSeconds)
+            .unwrap_or(DEFAULT_CIRCUIT_BREAKER_WINDOW_SECONDS);
+
+        let now = env.ledger().timestamp();
+        let window_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerWindowStart)
+            .unwrap_or(0);
+        
+        let current_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerWindowCount)
+            .unwrap_or(0);
+
+        // Check if we need to reset the window (time elapsed)
+        if window_start == 0 || now >= window_start.saturating_add(window_seconds) {
+            // Window expired or not started, reset counter
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerWindowStart, &now);
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerWindowCount, &mint_count);
+        } else {
+            // Within current window, increment counter
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerWindowCount, &current_count.saturating_add(mint_count));
+        }
+    }
+
+    /// Trigger the circuit breaker by pausing the contract.
+    fn trigger_circuit_breaker(env: &Env, mint_count: u64, threshold: u64, window_seconds: u64) -> Result<(), Error> {
+        // Set pause flag immediately (no timelock for automatic circuit breaker)
+        env.storage().instance().set(&DataKey::Paused, &true);
+        
+        // Emit event
+        env.events().publish(
+            (symbol_short!("circuit"),),
+            CircuitBreakerTriggeredEvent {
+                mint_count,
+                threshold,
+                window_seconds,
+            },
+        );
+
+        Err(Error::CircuitBreakerTripped)
     }
 
     // -------------------------------------------------------------------------
@@ -3683,7 +3980,7 @@ mod tests {
             &sig,
         );
         assert_eq!(result, Err(Ok(Error::ContractPaused)));
-        let owned = client.tokens_of_owner(&user1);
+        let owned = client.tokens_of_owner(&user1, &None, &None);
         assert_eq!(owned.len(), 2);
         assert_eq!(owned.get(0).unwrap(), t1);
         assert_eq!(owned.get(1).unwrap(), t2);
@@ -3699,7 +3996,7 @@ mod tests {
 
         do_mint(&client, &env, &user1, 403, &kp);
 
-        let owned = client.tokens_of_owner(&user2);
+        let owned = client.tokens_of_owner(&user2, &None, &None);
         assert_eq!(owned.len(), 0);
     }
 
@@ -3714,8 +4011,8 @@ mod tests {
         let token_id = do_mint(&client, &env, &user1, 404, &kp);
         client.transfer(&user1, &user2, &token_id);
 
-        assert_eq!(client.tokens_of_owner(&user1).len(), 0);
-        assert_eq!(client.tokens_of_owner(&user2).len(), 1);
+        assert_eq!(client.tokens_of_owner(&user1, &None, &None).len(), 0);
+        assert_eq!(client.tokens_of_owner(&user2, &None, &None).len(), 1);
     }
 
     #[test]
@@ -3736,13 +4033,136 @@ mod tests {
             minted.push_back(token_id);
         }
 
-        let owned = client.tokens_of_owner(&user1);
+        let owned = client.tokens_of_owner(&user1, &None, &None);
         assert_eq!(owned.len(), 5);
         
         // Verify returned tokens match minted tokens
         for i in 0..5 {
             assert_eq!(owned.get(i as u32).unwrap(), minted.get(i as u32).unwrap());
         }
+    }
+
+    #[test]
+    fn test_tokens_of_owner_pagination_limit() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        // Mint 10 tokens
+        let mut minted = Vec::new(&env);
+        for i in 0..10u32 {
+            let token_id = do_mint(&client, &env, &user1, 600 + i, &kp);
+            minted.push_back(token_id);
+        }
+
+        // Test limit parameter
+        let page1 = client.tokens_of_owner(&user1, &Some(3u32), &None);
+        assert_eq!(page1.len(), 3);
+        assert_eq!(page1.get(0).unwrap(), minted.get(0).unwrap());
+        assert_eq!(page1.get(1).unwrap(), minted.get(1).unwrap());
+        assert_eq!(page1.get(2).unwrap(), minted.get(2).unwrap());
+
+        let page2 = client.tokens_of_owner(&user1, &Some(3u32), &None);
+        assert_eq!(page2.len(), 3);
+    }
+
+    #[test]
+    fn test_tokens_of_owner_pagination_offset() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        // Mint 10 tokens
+        let mut minted = Vec::new(&env);
+        for i in 0..10u32 {
+            let token_id = do_mint(&client, &env, &user1, 610 + i, &kp);
+            minted.push_back(token_id);
+        }
+
+        // Test offset parameter - skip first 3
+        let page = client.tokens_of_owner(&user1, &None, &Some(3u32));
+        assert_eq!(page.len(), 7);
+        assert_eq!(page.get(0).unwrap(), minted.get(3).unwrap());
+        assert_eq!(page.get(1).unwrap(), minted.get(4).unwrap());
+    }
+
+    #[test]
+    fn test_tokens_of_owner_pagination_limit_and_offset() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        // Mint 10 tokens
+        let mut minted = Vec::new(&env);
+        for i in 0..10u32 {
+            let token_id = do_mint(&client, &env, &user1, 620 + i, &kp);
+            minted.push_back(token_id);
+        }
+
+        // Test both limit and offset - get page 2 (skip 3, take 3)
+        let page1 = client.tokens_of_owner(&user1, &Some(3u32), &Some(0u32));
+        assert_eq!(page1.len(), 3);
+        assert_eq!(page1.get(0).unwrap(), minted.get(0).unwrap());
+        assert_eq!(page1.get(1).unwrap(), minted.get(1).unwrap());
+        assert_eq!(page1.get(2).unwrap(), minted.get(2).unwrap());
+
+        let page2 = client.tokens_of_owner(&user1, &Some(3u32), &Some(3u32));
+        assert_eq!(page2.len(), 3);
+        assert_eq!(page2.get(0).unwrap(), minted.get(3).unwrap());
+        assert_eq!(page2.get(1).unwrap(), minted.get(4).unwrap());
+        assert_eq!(page2.get(2).unwrap(), minted.get(5).unwrap());
+
+        let page3 = client.tokens_of_owner(&user1, &Some(3u32), &Some(6u32));
+        assert_eq!(page3.len(), 3);
+        assert_eq!(page3.get(0).unwrap(), minted.get(6).unwrap());
+        assert_eq!(page3.get(1).unwrap(), minted.get(7).unwrap());
+        assert_eq!(page3.get(2).unwrap(), minted.get(8).unwrap());
+
+        let page4 = client.tokens_of_owner(&user1, &Some(3u32), &Some(9u32));
+        assert_eq!(page4.len(), 1);
+        assert_eq!(page4.get(0).unwrap(), minted.get(9).unwrap());
+    }
+
+    #[test]
+    fn test_tokens_of_owner_pagination_limit_exceeds_max() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        // Mint 5 tokens
+        for i in 0..5u32 {
+            do_mint(&client, &env, &user1, 630 + i, &kp);
+        }
+
+        // Test that limit exceeding MAX_RESULTS is capped
+        let result = client.tokens_of_owner(&user1, &Some(2000u32), &None);
+        assert_eq!(result.len(), 5); // Only 5 tokens exist
+    }
+
+    #[test]
+    fn test_tokens_of_owner_pagination_offset_exceeds_count() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+        let kp = register_signer(&env, &client, &admin);
+
+        // Mint 5 tokens
+        for i in 0..5u32 {
+            do_mint(&client, &env, &user1, 635 + i, &kp);
+        }
+
+        // Test that offset exceeding token count returns empty
+        let result = client.tokens_of_owner(&user1, &None, &Some(10u32));
+        assert_eq!(result.len(), 0);
     }
 
     // -------------------------------------------------------------------------
@@ -4285,6 +4705,73 @@ mod tests {
             &None,
         );
         assert_eq!(result, Err(Ok(Error::InvalidTokenId)));
+    }
+
+    // -------------------------------------------------------------------------
+    // Circuit breaker tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_circuit_breaker_disabled_by_default() {
+        let (env, admin, _, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        assert!(!client.circuit_breaker_enabled());
+    }
+
+    #[test]
+    fn test_circuit_breaker_can_be_enabled() {
+        let (env, admin, _, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        client.set_circuit_breaker_enabled(&admin, &true);
+        assert!(client.circuit_breaker_enabled());
+    }
+
+    #[test]
+    fn test_circuit_breaker_threshold_configurable() {
+        let (env, admin, _, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        client.set_circuit_breaker_threshold(&admin, &50);
+        assert_eq!(client.circuit_breaker_threshold(), 50);
+    }
+
+    #[test]
+    fn test_circuit_breaker_window_configurable() {
+        let (env, admin, _, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        client.set_circuit_breaker_window(&admin, &30);
+        assert_eq!(client.circuit_breaker_window_seconds(), 30);
+    }
+
+    #[test]
+    fn test_circuit_breaker_non_admin_cannot_configure() {
+        let (env, admin, user1, _) = setup();
+        let contract_id = env.register(ClipsNftContract, ());
+        let client = ClipsNftContractClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let result = client.try_set_circuit_breaker_enabled(&user1, &true);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+        let result = client.try_set_circuit_breaker_threshold(&user1, &50);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+        let result = client.try_set_circuit_breaker_window(&user1, &30);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+        let result = client.try_reset_circuit_breaker(&user1);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
     }
 
 }
