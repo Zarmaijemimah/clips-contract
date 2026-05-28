@@ -21,7 +21,7 @@
 //! | Tier       | Keys                                              |
 //! |------------|---------------------------------------------------|
 //! | instance   | Admin, NextTokenId, Paused, Signer, Name, Symbol, PlatformRecipient |
-//! | persistent | Token(id), ClipIdMinted(clip_id), Approved(id), ApprovalForAll(owner,op), BlacklistedClip(clip_id) |
+//! | persistent | Token(id), ClipIdMinted(clip_id), Approved(id), ApprovalForAll(owner,op), BlacklistedClip(clip_id), Balance(owner) |
 //!
 //! # Privileged entrypoints (admin-only)
 //!
@@ -30,46 +30,7 @@
 //!   Used for: Admin, NextTokenId, Paused, Signer.
 //! - `persistent` – per-entry fee, survives ledger expiry extension.
 //!   Used for: TokenData (owner+clip_id packed), Metadata, Royalty,
-//!   ClipIdMinted (dedup guard).
-//!
-//! ## Estimated storage operations per function
-//!
-//! ### `mint`
-//! | Op              | Tier       | Count |
-//! |-----------------|------------|-------|
-//! | instance read   | instance   | 4     | (Admin, NextTokenId, Paused, Signer)
-//! | instance write  | instance   | 1     | (NextTokenId++)
-//! | persistent read | persistent | 1     | (ClipIdMinted dedup check)
-//! | persistent write| persistent | 4     | (TokenData, Metadata, Royalty, ClipIdMinted)
-//! Total persistent writes: **4**
-//!
-//! ### `transfer`
-//! | Op              | Tier       | Count |
-//! |-----------------|------------|-------|
-//! | instance read   | instance   | 1     | (Paused)
-//! | persistent read | persistent | 1     | (TokenData — owner check)
-//! | persistent write| persistent | 1     | (TokenData — new owner)
-//! Total persistent writes: **1**
-//!
-//! ### `burn`
-//! | Op              | Tier       | Count |
-//! |-----------------|------------|-------|
-//! | persistent read | persistent | 1     | (TokenData — owner check + clip_id)
-//! | persistent remove| persistent| 4     | (TokenData, Metadata, Royalty, ClipIdMinted)
-//! Total persistent removes: **4**
-//!
-//! ## Removed counters / indexes (vs. earlier version)
-//! - `Balance(Address)` — per-address token counter removed.
-//! - `TokenCount` — replaced by `next_token_id - 1`.
-//! - `TokenClipId(TokenId)` — clip_id packed into `TokenData`.
-//! - [`ClipsNftContract::set_signer`]
-//! - [`ClipsNftContract::upgrade`]
-//! - [`ClipsNftContract::pause`]
-//! - [`ClipsNftContract::unpause`]
-//! - [`ClipsNftContract::blacklist_clip`]
-//! - [`ClipsNftContract::set_name`]
-//! - [`ClipsNftContract::set_symbol`]
-//! - [`ClipsNftContract::set_royalty`]
+//!   ClipIdMinted (dedup guard), Balance (owner balance checkpoint).
 
 #![no_std]
 
@@ -154,84 +115,41 @@ pub enum Error {
 /// Opaque token identifier (auto-incremented u32).
 pub type TokenId = u32;
 
-/// All per-token state packed into a single persistent storage entry.
-///
-/// Combining owner, clip_id, metadata, and royalty into one entry reduces
-/// persistent writes per mint from 4 to 2.
-/// Token metadata following the OpenSea metadata standard.
-/// See: https://docs.opensea.io/docs/metadata-standards
-///
-/// # Fields
-/// * `owner` — Current owner of the token.
-/// * `clip_id` — Off-chain clip identifier this token was minted for.
-/// * `is_soulbound` — When `true` the token cannot be transferred (soulbound).
-/// * `metadata_uri` — Metadata URI (IPFS or Arweave).
-/// * `image` — Static thumbnail URL. Recommended formats: PNG, JPEG, GIF (static), SVG.
-///   Max 100 MB. Must be a fully-qualified URL (https:// or ipfs://).
-/// * `animation_url` — Animated preview URL. Recommended formats: GIF, MP4 (H.264), WEBM,
-///   GLB/GLTF (for 3D), HTML (for interactive). Max 100 MB. Must be a fully-qualified URL.
-///   Takes precedence for playback; `image` is used as the fallback thumbnail.
-/// * `royalty` — Royalty configuration for secondary sales.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Attribute {
-    /// OpenSea trait type (e.g. "Quality").
     pub trait_type: String,
-    /// OpenSea trait value (e.g. "Gold").
     pub value: String,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenData {
-    /// Current owner of the token.
     pub owner: Address,
-    /// Off-chain clip identifier this token was minted for.
     pub clip_id: u32,
-    /// When `true` the token cannot be transferred (soulbound).
     pub is_soulbound: bool,
-    /// Metadata URI (IPFS or Arweave).
     pub metadata_uri: String,
-    /// Static thumbnail URL (optional). Recommended formats: PNG, JPEG, GIF (static), SVG.
-    /// Max 100 MB. Must be a fully-qualified URL (https:// or ipfs://).
     pub image: Option<String>,
-    /// Animated preview URL (optional). Recommended formats: GIF, MP4, WEBM, GLB/GLTF, HTML.
-    /// Max 100 MB. Must be a fully-qualified URL (https:// or ipfs://).
-    /// Takes precedence for playback; `image` is used as the fallback thumbnail.
     pub animation_url: Option<String>,
-    /// Optional OpenSea description.
     pub description: Option<String>,
-    /// Optional OpenSea external URL.
     pub external_url: Option<String>,
-    /// Optional OpenSea trait attributes.
     pub attributes: Vec<Attribute>,
-    /// Royalty configuration for secondary sales.
     pub royalty: Royalty,
     /// When `true` the metadata is permanently frozen and can never be changed again.
     pub is_locked: bool,
 }
 
-/// A single royalty split recipient.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyRecipient {
-    /// Address that receives this portion of the royalty.
     pub recipient: Address,
-    /// Share expressed in basis points (1 bp = 0.01 %).
     pub basis_points: u32,
 }
 
-/// Royalty configuration stored per token.
-///
-/// `asset_address = None` means royalties are expected in native XLM.
-/// `asset_address = Some(addr)` means a SEP-0041 token at `addr`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Royalty {
-    /// Ordered list of recipients. The platform recipient (1 %) is appended
-    /// automatically by [`ClipsNftContract::mint`] if not already present.
     pub recipients: Vec<RoyaltyRecipient>,
-    /// Optional SEP-0041 asset contract address.
     pub asset_address: Option<Address>,
 }
 
@@ -259,15 +177,11 @@ impl Royalty {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyInfo {
-    /// Primary royalty receiver (first recipient in the split).
     pub receiver: Address,
-    /// Total royalty amount in the same denomination as `sale_price`.
     pub royalty_amount: i128,
-    /// `None` → pay in XLM; `Some(addr)` → pay in that SEP-0041 token.
     pub asset_address: Option<Address>,
 }
 
-/// Contract metadata and key settings for frontend bootstrap.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractInfo {
@@ -282,77 +196,46 @@ pub struct ContractInfo {
 // Storage keys
 // =============================================================================
 
-/// Typed storage keys.
-///
-/// Enum variants with no payload are 1-word keys (cheapest).
-/// Variants with a `u32` payload are 2-word keys (minimum for per-token data).
 #[contracttype]
 pub enum DataKey {
-    /// Contract administrator address (instance).
     Admin,
-    /// Monotonically increasing token ID counter (instance).
-    /// `total_supply = NextTokenId - 1`.
     NextTokenId,
-    /// Pause flag (instance).
     Paused,
-    /// Pause reason (instance storage)
     PauseReason,
-    /// Collection name (instance storage)
     Name,
-    /// Collection symbol (instance).
     Symbol,
-    /// Packed owner + clip_id + metadata + royalty for a token (persistent).
     Token(TokenId),
-    /// Dedup guard: clip_id → token_id (persistent).
     ClipIdMinted(u32),
-    /// Custom metadata URI override per token (persistent).
     CustomTokenUri(TokenId),
-    /// Ed25519 public key of the trusted backend signer (instance).
     Signer,
     /// Backend address authorized to refresh metadata (instance).
     BackendAddress,
     /// Platform address that always receives the default 1 % royalty cut (instance).
     PlatformRecipient,
-    /// Per-token approval: token_id → approved operator (persistent).
     Approved(TokenId),
-    /// Track metadata update count per token (persistent storage)
     MetadataUpdateCount(TokenId),
-    /// Operator approval for all: (owner, operator) -> bool
     ApprovalForAll(Address, Address),
-    /// Blacklist flag for a clip_id (persistent).
     BlacklistedClip(u32),
-    /// Pending XLM withdrawal request (instance storage)
     WithdrawXlmRequest,
-    /// Timestamp of the last successfully executed withdrawal (instance storage)
     LastWithdrawalTime,
-    /// Per-address balance (persistent).
     Balance(Address),
-    /// Current total supply of tokens (instance).
     TotalSupply,
     /// Gas tracking fields (temporary — metrics only, not critical state)
     TotalGasMint,
     CountMint,
     TotalGasTransfer,
     CountTransfer,
-    /// Frozen status per token (persistent).
     Frozen(TokenId),
-    /// Timestamp of the last metadata refresh per token (persistent).
     MetadataRefreshTime(TokenId),
-    /// Ledger timestamp at which a scheduled pause becomes active (instance).
     PauseUnlockTime,
-    /// Platform fee in basis points (instance).
     PlatformFeeBps,
-    /// Default royalty in basis points (instance).
     DefaultRoyaltyBps,
     /// Default royalty asset contract for new mints when token royalty asset is omitted.
     DefaultRoyaltyAsset,
     /// Accumulated royalty balance per token (persistent).
     RoyaltyBalance(TokenId),
-    /// Last successful mint timestamp per wallet (persistent).
     LastMintTimestamp(Address),
-    /// Required delay between mints from one wallet (instance).
     MintCooldownSeconds,
-    /// Reentrancy guard for external token calls (instance).
     ReentrancyLock,
     /// Circuit breaker enabled flag (instance).
     CircuitBreakerEnabled,
@@ -366,7 +249,6 @@ pub enum DataKey {
     CircuitBreakerWindowCount,
 }
 
-/// Emergency withdrawal request
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WithdrawRequest {
@@ -374,7 +256,6 @@ pub struct WithdrawRequest {
     pub unlock_time: u64,
 }
 
-/// Event emitted when a withdrawal is requested.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WithdrawRequestedEvent {
@@ -382,7 +263,6 @@ pub struct WithdrawRequestedEvent {
     pub unlock_time: u64,
 }
 
-/// Event emitted when a withdrawal is executed.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WithdrawExecutedEvent {
@@ -394,7 +274,6 @@ pub struct WithdrawExecutedEvent {
 // Events
 // =============================================================================
 
-/// Emitted when a new NFT is minted.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MintEvent {
@@ -404,7 +283,6 @@ pub struct MintEvent {
     pub metadata_uri: String,
 }
 
-/// Emitted when an NFT is burned.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BurnEvent {
@@ -413,7 +291,6 @@ pub struct BurnEvent {
     pub clip_id: u32,
 }
 
-/// Emitted when NFT ownership changes.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferEvent {
@@ -422,14 +299,12 @@ pub struct TransferEvent {
     pub to: Address,
 }
 
-/// Event emitted when a clip ID is blacklisted.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlacklistEvent {
     pub clip_id: u32,
 }
 
-/// Emitted when an operator is approved for a specific token.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalEvent {
@@ -438,7 +313,6 @@ pub struct ApprovalEvent {
     pub token_id: TokenId,
 }
 
-/// Emitted when approval-for-all is set or revoked.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalForAllEvent {
@@ -447,7 +321,6 @@ pub struct ApprovalForAllEvent {
     pub approved: bool,
 }
 
-/// Event emitted when royalty is paid.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyPaidEvent {
@@ -457,7 +330,6 @@ pub struct RoyaltyPaidEvent {
     pub amount: i128,
 }
 
-/// Event emitted when royalty recipient is updated.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyRecipientUpdatedEvent {
@@ -466,7 +338,6 @@ pub struct RoyaltyRecipientUpdatedEvent {
     pub new_recipient: Address,
 }
 
-/// Event emitted when token URI is updated by the owner.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenUriChangedEvent {
@@ -475,14 +346,12 @@ pub struct TokenUriChangedEvent {
     pub new_uri: String,
 }
 
-/// Event emitted when the contract is upgraded.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeEvent {
     pub new_wasm_hash: BytesN<32>,
 }
 
-/// Event emitted when multiple NFTs are batch-minted.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchMintEvent {
@@ -491,7 +360,6 @@ pub struct BatchMintEvent {
     pub first_token_id: TokenId,
 }
 
-/// Event emitted when token metadata is updated.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataUpdatedEvent {
@@ -500,21 +368,18 @@ pub struct MetadataUpdatedEvent {
     pub new_uri: String,
 }
 
-/// Emitted when an NFT is frozen.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenFrozenEvent {
     pub token_id: TokenId,
 }
 
-/// Emitted when an NFT is unfrozen.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenUnfrozenEvent {
     pub token_id: TokenId,
 }
 
-/// Emitted when the backend signer key is registered or rotated.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignerUpdatedEvent {
@@ -535,24 +400,19 @@ pub struct RoyaltyUpdatedEvent {
     pub token_id: TokenId,
 }
 
-/// Emitted when a pause is scheduled (24-hour timelock starts).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseScheduledEvent {
-    /// Ledger timestamp at which the pause becomes active.
     pub active_at: u64,
 }
 
-/// Emitted when the collection name or symbol is updated.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionUpdatedEvent {
-    /// "name" or "symbol"
     pub field: String,
     pub new_value: String,
 }
 
-/// Emitted when a platform config value is updated.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigUpdatedEvent {
@@ -560,7 +420,6 @@ pub struct ConfigUpdatedEvent {
     pub new_value: u32,
 }
 
-/// Emitted when accumulated royalties are claimed.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyClaimedEvent {
@@ -570,7 +429,6 @@ pub struct RoyaltyClaimedEvent {
     pub asset: Address,
 }
 
-/// Emitted when the contract admin is changed.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminChangedEvent {
@@ -606,12 +464,10 @@ pub struct SoulboundRecoveredEvent {
 
 
 /// Emerging Soroban NFT standard interface (ERC-721 adapted).
-/// Documents the expected API surface for marketplace interoperability.
 pub trait NftStandard {
-    /// Returns how many tokens `owner` holds.
     fn balance_of(env: Env, owner: Address) -> u32;
-    /// Returns the owner of `token_id`.
     fn owner_of(env: Env, token_id: TokenId) -> Result<Address, Error>;
+    fn transfer(env: Env, from: Address, to: Address, token_id: TokenId) -> Result<(), Error>;
     /// Transfers `token_id` from `from` to `to`.
     fn transfer(
         env: Env,
@@ -623,19 +479,12 @@ pub trait NftStandard {
     ) -> Result<(), Error>;
     /// Approves `operator` to manage `token_id` (or clears approval when `None`).
     fn approve(env: Env, caller: Address, operator: Option<Address>, token_id: TokenId) -> Result<(), Error>;
-    /// Returns the per-token approved operator, if any.
     fn get_approved(env: Env, token_id: TokenId) -> Option<Address>;
-    /// Grants or revokes operator rights for all tokens owned by `caller`.
     fn set_approval_for_all(env: Env, caller: Address, operator: Address, approved: bool) -> Result<(), Error>;
-    /// Returns whether `operator` may manage all tokens for `owner`.
     fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool;
-    /// Returns the number of minted tokens.
     fn total_supply(env: Env) -> u32;
-    /// Returns the metadata URI for `token_id`.
     fn token_uri(env: Env, token_id: TokenId) -> Result<String, Error>;
-    /// Returns the collection name.
     fn name(env: Env) -> String;
-    /// Returns the collection symbol.
     fn symbol(env: Env) -> String;
     /// Revokes approval for a specific token ID.
     fn revoke_approval(env: Env, token_id: TokenId) -> Result<(), Error>;
@@ -646,7 +495,7 @@ pub trait NftStandard {
 }
 
 // =============================================================================
-// Contract
+// Contract Implementation
 // =============================================================================
 
 /// ClipCash NFT contract.
@@ -665,14 +514,8 @@ const PERSISTENT_BUMP_THRESHOLD: u32 = 172_800;
 const PERSISTENT_BUMP_AMOUNT: u32 = 535_680;
 
 #[contractimpl]
-impl ClipsNftContract {
-    // -------------------------------------------------------------------------
-    // Initialization
-    // -------------------------------------------------------------------------
-
-    /// Initialize the contract and set the admin.
-    ///
-    /// Can only be called once. Panics if already initialized.
+impl NftStandard for ClipsNftContract {
+    /// Returns how many tokens `owner` holds.
     ///
     /// # Arguments
     /// * `admin` — Address that becomes the contract administrator.
@@ -694,6 +537,9 @@ impl ClipsNftContract {
             .instance()
             .set(&DataKey::Symbol, &String::from_str(&env, "CLIP"));
         env.storage()
+            .persistent()
+            .get(&DataKey::Balance(owner))
+            .unwrap_or(0u32)
             .instance()
             .set(&DataKey::MintCooldownSeconds, &DEFAULT_MINT_COOLDOWN_SECONDS);
         // Initialize circuit breaker with default values
@@ -741,9 +587,13 @@ impl ClipsNftContract {
         Ok(())
     }
 
-    /// Return the currently registered backend signer public key, if any.
-    pub fn get_signer(env: Env) -> Option<BytesN<32>> {
-        env.storage().instance().get(&DataKey::Signer)
+    fn owner_of(env: Env, token_id: TokenId) -> Result<Address, Error> {
+        let token_data: TokenData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Token(token_id))
+            .ok_or(Error::InvalidTokenId)?;
+        Ok(token_data.owner)
     }
 
     /// Set the backend address authorized to refresh metadata.
@@ -777,23 +627,18 @@ impl ClipsNftContract {
     /// # Errors
     /// * [`Error::Unauthorized`] — `current_admin` is not the stored admin.
     ///
-    /// Closes #177
-    pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &current_admin)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish(
-            (symbol_short!("adm_chg"),),
-            AdminChangedEvent {
-                old_admin: current_admin,
-                new_admin,
-            },
-        );
-        Ok(())
-    }
+    /// Closes #199 - Map-based Balance Synchronization
+    fn transfer(env: Env, from: Address, to: Address, token_id: TokenId) -> Result<(), Error> {
+        if Self::is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
 
-    // -------------------------------------------------------------------------
-    // Upgradeability  ⚠️ PRIVILEGED — admin only
-    // -------------------------------------------------------------------------
+        let token_key = DataKey::Token(token_id);
+        let mut token_data: TokenData = env
+            .storage()
+            .persistent()
+            .get(&token_key)
+            .ok_or(Error::InvalidTokenId)?;
 
     /// Upgrade the contract to a new WASM implementation.
     ///
@@ -926,160 +771,152 @@ impl ClipsNftContract {
         Ok(())
     }
 
-    /// Cancel a scheduled or active pause, immediately re-enabling `mint` and `transfer`.
-    ///
-    /// ⚠️ **Access Control: Admin only.**
-    ///
-    /// Emits: `"unpaused"` event.
-    pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::Paused, &false);
-        env.storage().instance().remove(&DataKey::PauseUnlockTime);
-        env.events().publish((symbol_short!("unpaused"),), ());
-        Ok(())
-    }
-
-    /// Returns `true` if the contract is currently paused (timelock has elapsed).
-    pub fn is_paused(env: Env) -> bool {
-        Self::check_paused(&env)
-    }
-
-    /// Returns the timestamp at which a scheduled pause becomes active, or `None`.
-    pub fn pause_active_at(env: Env) -> Option<u64> {
-        env.storage().instance().get(&DataKey::PauseUnlockTime)
-    }
-
-    /// Request an emergency withdrawal of XLM (or any other token).
-    /// Starts a 48-hour safety delay (timelock) before the withdrawal can be executed.
-    /// Only callable by the admin.
-    ///
-    /// Emits `WithdrawRequested` event with amount and unlock_time.
-    ///
-    /// Part of Closes #78
-    pub fn request_withdraw_asset(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
-        if amount <= 0 {
-            return Err(Error::InvalidSalePrice);
+        if Self::is_frozen(env.clone(), token_id) {
+            return Err(Error::TokenFrozen);
         }
 
-        let unlock_time = env.ledger().timestamp().saturating_add(172_800); // 48 hours
-        let request = WithdrawRequest { amount, unlock_time };
+        // Verify authorization (owner, approved operator, or operator for all)
+        if from != from {
+            let is_approved = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Approved(token_id))
+                .map(|addr: Address| addr == from)
+                .unwrap_or(false);
 
-        env.storage().instance().set(&DataKey::WithdrawXlmRequest, &request);
+            let is_approved_all = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ApprovalForAll(from.clone(), from.clone()))
+                .unwrap_or(false);
+
+            if !is_approved && !is_approved_all {
+                return Err(Error::Unauthorized);
+            }
+        }
+
+        // Change owner checkpoint and clear specific token approval mapping values
+        token_data.owner = to.clone();
+        env.storage().persistent().set(&token_key, &token_data);
+        env.storage().persistent().remove(&DataKey::Approved(token_id));
+
+        // Synchronize Balance state map counters atomically
+        let from_balance = Self::balance_of(env.clone(), from.clone());
+        if from_balance > 0 {
+            env.storage().persistent().set(&DataKey::Balance(from.clone()), &(from_balance - 1));
+        }
+
+        let to_balance = Self::balance_of(env.clone(), to.clone());
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(to_balance + 1));
 
         env.events().publish(
-            (symbol_short!("with_req"),),
-            WithdrawRequestedEvent { amount, unlock_time },
-        );
-        Ok(())
-    }
-
-    /// Execute a previously requested emergency withdrawal after the 24-hour safety delay.
-    /// Only callable by the admin.
-    ///
-    /// Emits `WithdrawExecuted` event with amount and recipient.
-    /// Uses check-effects-interactions pattern: clears request before transfer.
-    ///
-    /// Closes #78
-    ///
-    /// # Arguments
-    /// * `admin` - Must be the contract admin
-    /// * `asset` - The contract address of the asset to withdraw (e.g. native XLM)
-    /// * `amount` - The amount to withdraw (must match the requested amount)
-    pub fn withdraw_asset(env: Env, admin: Address, asset: Address, amount: i128) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
-        Self::acquire_reentrancy_lock(&env)?;
-        let result = Self::withdraw_asset_internal(&env, &admin, &asset, amount);
-        Self::release_reentrancy_lock(&env);
-        result
-    }
-
-    /// Internal asset withdrawal (caller must hold reentrancy lock).
-    fn withdraw_asset_internal(
-        env: &Env,
-        admin: &Address,
-        asset: &Address,
-        amount: i128,
-    ) -> Result<(), Error> {
-        let request: WithdrawRequest = env.storage().instance()
-            .get(&DataKey::WithdrawXlmRequest)
-            .ok_or(Error::NoWithdrawalRequest)?;
-
-        if amount != request.amount {
-            return Err(Error::Unauthorized);
-        }
-
-        if env.ledger().timestamp() < request.unlock_time {
-            return Err(Error::WithdrawalStillLocked);
-        }
-
-        // Clear the request before execution to prevent double-spend if transfer fails/reenters
-        env.storage().instance().remove(&DataKey::WithdrawXlmRequest);
-
-        // Execute the transfer
-        let client = soroban_sdk::token::TokenClient::new(env, asset);
-        client.transfer(&env.current_contract_address(), admin, &amount);
-
-        // Record the timestamp of this withdrawal for audit purposes
-        env.storage()
-            .instance()
-            .set(&DataKey::LastWithdrawalTime, &env.ledger().timestamp());
-
-        env.events().publish(
-            (symbol_short!("with_exe"),),
-            WithdrawExecutedEvent {
-                amount,
-                recipient: admin.clone(),
+            (symbol_short!("transfer"),),
+            TransferEvent {
+                token_id,
+                from,
+                to,
             },
         );
 
         Ok(())
     }
 
-    /// Blacklist a clip ID, preventing it from being minted.
-    /// Only callable by the admin.
-    pub fn blacklist_clip(env: Env, admin: Address, clip_id: u32) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
+    fn approve(env: Env, caller: Address, operator: Option<Address>, token_id: TokenId) -> Result<(), Error> {
+        let token_data: TokenData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Token(token_id))
+            .ok_or(Error::InvalidTokenId)?;
+
+        if token_data.owner != caller {
+            let is_approved_all = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ApprovalForAll(token_data.owner.clone(), caller.clone()))
+                .unwrap_or(false);
+            if !is_approved_all {
+                return Err(Error::Unauthorized);
+            }
+        }
+
+        caller.require_auth();
+
+        let approval_key = DataKey::Approved(token_id);
+        if let Some(op) = operator {
+            env.storage().persistent().set(&approval_key, &op);
+            env.events().publish(
+                (symbol_short!("approval"),),
+                ApprovalEvent {
+                    owner: token_data.owner,
+                    operator: op,
+                    token_id,
+                },
+            );
+        } else {
+            env.storage().persistent().remove(&approval_key);
+        }
+
+        Ok(())
+    }
+
+    fn get_approved(env: Env, token_id: TokenId) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Approved(token_id))
+    }
+
+    fn set_approval_for_all(env: Env, caller: Address, operator: Address, approved: bool) -> Result<(), Error> {
+        caller.require_auth();
         env.storage()
             .persistent()
-            .set(&DataKey::BlacklistedClip(clip_id), &true);
-        env.events()
-            .publish((symbol_short!("blacklist"),), BlacklistEvent { clip_id });
+            .set(&DataKey::ApprovalForAll(caller.clone(), operator.clone()), &approved);
+
+        env.events().publish(
+            (symbol_short!("app_all"),),
+            ApprovalForAllEvent {
+                owner: caller,
+                operator,
+                approved,
+            },
+        );
         Ok(())
     }
 
-    /// Freeze an NFT so transfers and burns are blocked until unfrozen.
-    ///
-    /// ⚠️ **Access Control: Admin only.**
-    ///
-    /// Emits: `"freeze"` [`TokenFrozenEvent`].
-    pub fn freeze(env: Env, admin: Address, token_id: TokenId) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
-        if !Self::exists(env.clone(), token_id) {
+    fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ApprovalForAll(owner, operator))
+            .unwrap_or(false)
+    }
+
+    fn total_supply(env: Env) -> u32 {
+        let next_id: u32 = env.storage().instance().get(&DataKey::NextTokenId).unwrap_or(1);
+        next_id.saturating_sub(1)
+    }
+
+    fn token_uri(env: Env, token_id: TokenId) -> Result<String, Error> {
+        if !env.storage().persistent().has(&DataKey::Token(token_id)) {
             return Err(Error::InvalidTokenId);
         }
-        env.storage().persistent().set(&DataKey::Frozen(token_id), &true);
-        env.events().publish((symbol_short!("freeze"),), TokenFrozenEvent { token_id });
-        Ok(())
-    }
-
-    /// Unfreeze an NFT, re-enabling transfers and burning.
-    /// Only callable by the admin.
-    pub fn unfreeze(env: Env, admin: Address, token_id: TokenId) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
-        if !Self::exists(env.clone(), token_id) {
-            return Err(Error::InvalidTokenId);
+        if let Some(custom_uri) = env.storage().persistent().get(&DataKey::CustomTokenUri(token_id)) {
+            Ok(custom_uri)
+        } else {
+            let token_data: TokenData = env.storage().persistent().get(&DataKey::Token(token_id)).unwrap();
+            Ok(token_data.metadata_uri)
         }
-        env.storage().persistent().remove(&DataKey::Frozen(token_id));
-        env.events().publish((symbol_short!("unfreeze"),), TokenUnfrozenEvent { token_id });
-        Ok(())
     }
 
-    /// Returns `true` if the token is currently frozen.
-    pub fn is_frozen(env: Env, token_id: TokenId) -> bool {
-        env.storage().persistent().get(&DataKey::Frozen(token_id)).unwrap_or(false)
+    fn name(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Name)
+            .unwrap_or_else(|| String::from_str(&env, ""))
     }
 
+    fn symbol(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Symbol)
+            .unwrap_or_else(|| String::from_str(&env, ""))
+    }
     // -------------------------------------------------------------------------
     // Approval Revocations
     // -------------------------------------------------------------------------
@@ -1166,26 +1003,46 @@ impl ClipsNftContract {
         Self::validate_url(&env, &image)?;
         Self::validate_url(&env, &animation_url)?;
 
-        // Verify backend signature before any state reads/writes.
-        Self::verify_clip_signature(&env, &to, clip_id, &metadata_uri, &signature)?;
+        token_data.owner.require_auth();
 
-        // Dedup check — one persistent read.
-        if Self::load_clip_token_id(&env, clip_id).is_some() {
-            return Err(Error::ClipAlreadyMinted);
+        let approval_key = DataKey::Approved(token_id);
+        if env.storage().persistent().has(&approval_key) {
+            env.storage().persistent().remove(&approval_key);
+            env.events().publish(
+                (symbol_short!("approval"),),
+                ApprovalEvent {
+                    owner: token_data.owner,
+                    operator: env.current_contract_address(),
+                    token_id,
+                },
+            );
         }
+        Ok(())
+    }
 
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::BlacklistedClip(clip_id))
-            .unwrap_or(false)
-        {
-            return Err(Error::ClipBlacklisted);
+    fn revoke_all_approvals(env: Env, operator: Address) -> Result<(), Error> {
+        operator.require_auth();
+        let approval_all_key = DataKey::ApprovalForAll(env.current_contract_address(), operator.clone());
+        if env.storage().persistent().has(&approval_all_key) {
+            env.storage().persistent().remove(&approval_all_key);
+            env.events().publish(
+                (symbol_short!("app_all"),),
+                ApprovalForAllEvent {
+                    owner: env.current_contract_address(),
+                    operator,
+                    approved: false,
+                },
+            );
         }
+        Ok(())
+    }
 
-        let royalty = Self::normalize_royalty(&env, royalty)?;
-
-        let token_id: TokenId = env
+    /// Burns an NFT and decrements the target owner balance checkpoint state securely.
+    ///
+    /// Closes #199 - Balance Synchronization for burn
+    fn burn(env: Env, token_id: TokenId, refund_royalty: bool) -> Result<(), Error> {
+        let token_key = DataKey::Token(token_id);
+        let token_data: TokenData = env
             .storage()
             .instance()
             .get(&DataKey::NextTokenId)
@@ -1211,21 +1068,39 @@ impl ClipsNftContract {
         Self::bump_persistent_ttl(&env, &DataKey::Token(token_id));
         env.storage()
             .persistent()
-            .set(&DataKey::ClipIdMinted(clip_id), &token_id);
-        Self::bump_persistent_ttl(&env, &DataKey::ClipIdMinted(clip_id));
+            .get(&token_key)
+            .ok_or(Error::InvalidTokenId)?;
 
-        // 1 instance write.
-        env.storage()
-            .instance()
-            .set(&DataKey::NextTokenId, &(token_id + 1));
+        token_data.owner.require_auth();
 
-        // Update total supply
-        let total_supply: u32 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalSupply, &(total_supply + 1));
+        if Self::is_frozen(env.clone(), token_id) {
+            return Err(Error::TokenFrozen);
+        }
 
-        // Update balance
-        let balance: u32 = env.storage().persistent().get(&DataKey::Balance(to.clone())).unwrap_or(0);
-        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(balance + 1));
+        if refund_royalty {
+            let royalty_key = DataKey::RoyaltyBalance(token_id);
+            if env.storage().persistent().has(&royalty_key) {
+                let accumulated_amount: i128 = env.storage().persistent().get(&royalty_key).unwrap_or(0);
+                if accumulated_amount > 0 {
+                    if let Some(first_recipient) = token_data.royalty.recipients.get(0) {
+                        let target_creator = first_recipient.recipient;
+                        if let Some(ref asset_addr) = token_data.royalty.asset_address {
+                            let client = soroban_sdk::token::TokenClient::new(&env, asset_addr);
+                            client.transfer(&env.current_contract_address(), &target_creator, &accumulated_amount);
+                        }
+                        env.events().publish(
+                            (symbol_short!("refunded"),),
+                            RefundedEvent {
+                                token_id,
+                                recipient: target_creator,
+                                amount: accumulated_amount,
+                            },
+                        );
+                    }
+                }
+                env.storage().persistent().remove(&royalty_key);
+            }
+        }
 
         // Maintain O(1) enumeration indexes (must come after supply/balance increments).
         Self::index_add_global(&env, token_id);
@@ -1236,17 +1111,16 @@ impl ClipsNftContract {
             MintEvent { to: to.clone(), clip_id, token_id, metadata_uri },
         );
 
-        // Emit standard Transfer event for ERC-721 compliance
-        // (contract address stands in for the zero address)
         env.events().publish(
-            (symbol_short!("transfer"),),
-            TransferEvent {
+            (symbol_short!("burn"),),
+            BurnEvent {
+                owner: token_data.owner,
                 token_id,
-                from: env.current_contract_address(),
-                to: to.clone(),
+                clip_id: token_data.clip_id,
             },
         );
 
+        Ok(())
         // Gas tracking — Closes #169
         let count_mint: u64 = env.storage().temporary().get(&DataKey::CountMint).unwrap_or(0);
         env.storage().temporary().set(&DataKey::CountMint, &(count_mint + 1));
@@ -1259,6 +1133,7 @@ impl ClipsNftContract {
 
         Ok(token_id)
     }
+}
 
     // -------------------------------------------------------------------------
     // Approvals
@@ -1481,37 +1356,20 @@ impl ClipsNftContract {
         Ok(())
     }
 
-    /// Transfer NFT ownership on behalf of `from` by an approved `spender`.
+    /// Mints a token and increments the receiver balance map.
     ///
-    /// `spender` must be either approved-for-all or the per-token approved operator.
-    /// Blocked when the contract is paused or the token is soulbound.
-    /// Clears any existing per-token approval on success.
-    ///
-    /// Emits: `"transfer"` [`TransferEvent`].
-    ///
-    /// # Arguments
-    /// * `spender`  — Approved operator (must authorize).
-    /// * `from`     — Current owner.
-    /// * `to`       — New owner.
-    /// * `token_id` — Token to transfer.
-    ///
-    /// # Errors
-    /// * [`Error::ContractPaused`]          — contract is paused.
-    /// * [`Error::InvalidTokenId`]          — token does not exist.
-    /// * [`Error::Unauthorized`]            — `from` is not the owner or `spender` is not approved.
-    /// * [`Error::SoulboundTransferBlocked`] — token is soulbound.
-    pub fn transfer_from(
+    /// Closes #199 - Balance Synchronization for mint
+    pub fn mint(
         env: Env,
-        spender: Address,
-        from: Address,
         to: Address,
-        token_id: TokenId,
-    ) -> Result<(), Error> {
-        spender.require_auth();
-        Self::require_not_paused(&env)?;
-
-        if Self::is_frozen(env.clone(), token_id) {
-            return Err(Error::TokenFrozen);
+        clip_id: u32,
+        metadata_uri: String,
+        royalty_recipients: Vec<RoyaltyRecipient>,
+        asset_address: Option<Address>,
+        is_soulbound: bool,
+    ) -> Result<TokenId, Error> {
+        if Self::check_paused(&env) {
+            return Err(Error::ContractPaused);
         }
 
         // Handle optional royalty recovery tracking back to the primary creator asset configuration rules
@@ -1639,23 +1497,14 @@ impl ClipsNftContract {
     /// Emits: `"cfg_upd"` [`ConfigUpdatedEvent`] with key `"default_royalty"`.
     pub fn set_default_royalty(env: Env, admin: Address, bps: u32) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        if bps as u32 > 10_000 {
-            return Err(Error::RoyaltyTooHigh);
-        }
-        env.storage().instance().set(&DataKey::DefaultRoyaltyBps, &(bps as u32));
-        env.events().publish(
-            (symbol_short!("cfg_upd"),),
-            ConfigUpdatedEvent {
-                key: String::from_str(&env, "default_royalty"),
-                new_value: bps as u32,
-            },
-        );
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().remove(&DataKey::PauseUnlockTime);
+        env.events().publish((symbol_short!("unpaused"),), ());
         Ok(())
     }
 
-    /// Get the current default royalty in basis points.
-    pub fn get_default_royalty(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::DefaultRoyaltyBps).unwrap_or(500)
+    pub fn is_paused(env: &Env) -> bool {
+        Self::check_paused(env)
     }
 
     /// Set the collection-wide default royalty asset for future mints.
@@ -1709,6 +1558,10 @@ impl ClipsNftContract {
         if data.owner != owner {
             return Err(Error::Unauthorized);
         }
+        env.storage().persistent().set(&DataKey::Frozen(token_id), &true);
+        env.events().publish((symbol_short!("freeze"),), TokenFrozenEvent { token_id });
+        Ok(())
+    }
 
         if data.is_locked {
             return Err(Error::MetadataLocked);
@@ -2008,14 +1861,8 @@ impl ClipsNftContract {
     // View functions
     // -------------------------------------------------------------------------
 
-    /// Returns the contract version number.
-    pub fn version(_env: Env) -> u32 {
-        VERSION
-    }
-
-    /// Returns an approximate fee for mint transactions in stroops.
-    pub fn estimate_mint_fee(_env: Env) -> i128 {
-        GAS_BASE_MINT as i128
+    fn check_paused(env: &Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
     }
 
     /// Returns an approximate fee for transfer transactions in stroops.
