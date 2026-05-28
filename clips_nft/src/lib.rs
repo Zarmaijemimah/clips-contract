@@ -181,63 +181,113 @@ pub enum DataKey {
 // Events
 // =============================================================================
 
+// Emitted on mint completion and useful for frontend tokens/indexing.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MintEvent { pub to: Address, pub clip_id: u32, pub token_id: TokenId, pub metadata_uri: String }
 
+// Emitted when a token is destroyed.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BurnEvent { pub owner: Address, pub token_id: TokenId, pub clip_id: u32 }
 
+// Emitted on token ownership transfer.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferEvent { pub token_id: TokenId, pub from: Address, pub to: Address }
 
+// Emitted when a single-token approval is granted.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalEvent { pub owner: Address, pub operator: Address, pub token_id: TokenId }
 
+// Emitted when operator approval is toggled for all tokens of an owner.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalForAllEvent { pub owner: Address, pub operator: Address, pub approved: bool }
 
+// Emitted when royalty is paid during a transfer or sale.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyPaidEvent { pub token_id: TokenId, pub from: Address, pub to: Address, pub amount: i128 }
 
+// Emitted when the primary royalty recipient changes.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyRecipientUpdatedEvent { pub token_id: TokenId, pub old_recipient: Address, pub new_recipient: Address }
 
+// Emitted when royalty parameters are updated for a token.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyUpdatedEvent { pub token_id: TokenId }
 
+// Emitted when royalties are claimed from contract-held balances.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoyaltyClaimedEvent { pub token_id: TokenId, pub recipient: Address, pub amount: i128, pub asset: Address }
 
+// Emitted when a token URI is updated for a custom owner override.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenUriChangedEvent { pub token_id: TokenId, pub owner: Address, pub new_uri: String }
 
+// Emitted when metadata fields are refreshed by admin or backend.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataUpdatedEvent { pub token_id: TokenId, pub old_uri: String, pub new_uri: String }
 
+// Emitted when metadata is permanently locked.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataLockedEvent { pub token_id: TokenId, pub owner: Address }
 
+// Emitted after a batch mint completes.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchMintEvent { pub to: Address, pub count: u32, pub first_token_id: TokenId }
 
+// Emitted when a clip is blacklisted.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlacklistEvent { pub clip_id: u32 }
 
+// Emitted when a token freezes transfers.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenFrozenEvent { pub token_id: TokenId }
 
+// Emitted when a token freeze is lifted.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenUnfrozenEvent { pub token_id: TokenId }
 
+// Emitted when the backend signer public key changes.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignerUpdatedEvent { pub new_pubkey: BytesN<32> }
 
+// Emitted when pause is scheduled and becomes active.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseScheduledEvent { pub active_at: u64 }
 
-/// Task 2: emitted when platform_fee or default_royalty is updated
+// Emitted when the contract is unpaused.
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConfigUpdatedEvent { pub key: String, pub new_value: u32 }
+pub struct UnpausedEvent {}
+
+// Emitted when minting is paused.
+#[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseMintingEvent {}
+
+// Emitted when minting is resumed.
+#[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnpauseMintingEvent {}
+
+// Emitted when the backend address is updated.
+#[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendAddressUpdatedEvent { pub new_backend_address: Address }
+
+// Emitted when the platform recipient changes.
+#[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformRecipientUpdatedEvent { pub new_recipient: Address }
+
+// Emitted when the default royalty asset is updated.
+#[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DefaultRoyaltyAssetUpdatedEvent { pub asset_address: Option<Address> }
+
+// Emitted when the mint cooldown value changes.
+#[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MintCooldownUpdatedEvent { pub seconds: u64 }
+
+// Emitted when core config values change.
+#[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigUpdatedEvent { pub key: String, pub new_value: i128 }
+
+// Emitted when circuit breaker counters are reset by admin.
+#[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerResetEvent {}
 
 #[contracttype] #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminChangedEvent { pub old_admin: Address, pub new_admin: Address }
@@ -372,7 +422,7 @@ impl ClipsNftContract {
         let gas: u64 = env.storage().temporary().get(&DataKey::TotalGasMint).unwrap_or(0);
         env.storage().temporary().set(&DataKey::TotalGasMint, &gas.saturating_add(GAS_BASE_MINT));
 
-        env.events().publish((symbol_short!("mint"),), MintEvent { to, clip_id, token_id, metadata_uri });
+        env.events().publish((symbol_short!("mint"), token_id, to.clone()), MintEvent { to, clip_id, token_id, metadata_uri });
         Ok(token_id)
     }
 
@@ -412,7 +462,7 @@ impl ClipsNftContract {
                 cum_amt = total;
                 if amount > 0 {
                     token_client.transfer(&to, &split.recipient, &amount);
-                    env.events().publish((symbol_short!("royalty"),), RoyaltyPaidEvent { token_id, from: to.clone(), to: split.recipient, amount });
+                    env.events().publish((symbol_short!("royalty"), token_id, split.recipient.clone()), RoyaltyPaidEvent { token_id, from: to.clone(), to: split.recipient, amount });
                 }
             }
             Self::release_reentrancy_lock(&env);
@@ -435,7 +485,7 @@ impl ClipsNftContract {
         let gt: u64 = env.storage().temporary().get(&DataKey::TotalGasTransfer).unwrap_or(0);
         env.storage().temporary().set(&DataKey::TotalGasTransfer, &gt.saturating_add(GAS_BASE_TRANSFER));
 
-        env.events().publish((symbol_short!("transfer"),), TransferEvent { token_id, from, to });
+        env.events().publish((symbol_short!("transfer"), token_id, from.clone(), to.clone()), TransferEvent { token_id, from, to });
         Ok(())
     }
 
@@ -459,7 +509,7 @@ impl ClipsNftContract {
         env.storage().persistent().set(&DataKey::Balance(owner.clone()), &bal.saturating_sub(1));
         Self::index_remove_owner(&env, &owner, token_id);
 
-        env.events().publish((symbol_short!("burn"),), BurnEvent { owner, token_id, clip_id: data.clip_id });
+        env.events().publish((symbol_short!("burn"), token_id, owner.clone()), BurnEvent { owner, token_id, clip_id: data.clip_id });
         Ok(())
     }
 
@@ -473,7 +523,7 @@ impl ClipsNftContract {
         match operator {
             Some(op) => {
                 env.storage().persistent().set(&DataKey::Approved(token_id), &op);
-                env.events().publish((symbol_short!("approval"),), ApprovalEvent { owner: data.owner, operator: op, token_id });
+                env.events().publish((symbol_short!("approval"), token_id, data.owner.clone(), op.clone()), ApprovalEvent { owner: data.owner, operator: op, token_id });
             }
             None => { env.storage().persistent().remove(&DataKey::Approved(token_id)); }
         }
@@ -483,7 +533,7 @@ impl ClipsNftContract {
     pub fn set_approval_for_all(env: Env, caller: Address, operator: Address, approved: bool) -> Result<(), Error> {
         caller.require_auth();
         env.storage().persistent().set(&DataKey::ApprovalForAll(caller.clone(), operator.clone()), &approved);
-        env.events().publish((symbol_short!("app_all"),), ApprovalForAllEvent { owner: caller, operator, approved });
+        env.events().publish((symbol_short!("app_all"), caller.clone(), operator.clone()), ApprovalForAllEvent { owner: caller, operator, approved });
         Ok(())
     }
 
@@ -504,7 +554,7 @@ impl ClipsNftContract {
         Self::require_admin(&env, &admin)?;
         if bps > 10_000 { return Err(Error::RoyaltyTooHigh); }
         env.storage().instance().set(&DataKey::PlatformFeeBps, &bps);
-        env.events().publish((symbol_short!("cfg_upd"),), ConfigUpdatedEvent { key: String::from_str(&env, "platform_fee"), new_value: bps });
+        env.events().publish((symbol_short!("cfg_upd"), symbol_short!("platform_fee")), ConfigUpdatedEvent { key: String::from_str(&env, "platform_fee"), new_value: bps as i128 });
         Ok(())
     }
 
@@ -513,7 +563,7 @@ impl ClipsNftContract {
         Self::require_admin(&env, &admin)?;
         if bps > 10_000 { return Err(Error::RoyaltyTooHigh); }
         env.storage().instance().set(&DataKey::DefaultRoyaltyBps, &bps);
-        env.events().publish((symbol_short!("cfg_upd"),), ConfigUpdatedEvent { key: String::from_str(&env, "default_royalty"), new_value: bps });
+        env.events().publish((symbol_short!("cfg_upd"), symbol_short!("default_royalty")), ConfigUpdatedEvent { key: String::from_str(&env, "default_royalty"), new_value: bps as i128 });
         Ok(())
     }
 
@@ -592,13 +642,13 @@ impl ClipsNftContract {
             let or = old.recipients.get(0).ok_or(Error::InvalidRoyaltySplit)?;
             let nr = new_royalty.recipients.get(0).ok_or(Error::InvalidRoyaltySplit)?;
             if or.recipient != nr.recipient {
-                env.events().publish((symbol_short!("royalty"),), RoyaltyRecipientUpdatedEvent { token_id, old_recipient: or.recipient, new_recipient: nr.recipient });
+                env.events().publish((symbol_short!("royalty"), token_id, or.recipient.clone(), nr.recipient.clone()), RoyaltyRecipientUpdatedEvent { token_id, old_recipient: or.recipient, new_recipient: nr.recipient });
             }
         }
         let new_royalty = Self::normalize_royalty(&env, new_royalty)?;
         data.royalty = new_royalty;
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
-        env.events().publish((symbol_short!("roy_upd"),), RoyaltyUpdatedEvent { token_id });
+        env.events().publish((symbol_short!("roy_upd"), token_id), RoyaltyUpdatedEvent { token_id });
         Ok(())
     }
 
@@ -610,7 +660,7 @@ impl ClipsNftContract {
         let bps = data.royalty.recipients.get(0).ok_or(Error::InvalidRoyaltySplit)?.basis_points;
         data.royalty.recipients.set(0, RoyaltyRecipient { recipient: new_recipient.clone(), basis_points: bps });
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
-        env.events().publish((symbol_short!("royalty"),), RoyaltyRecipientUpdatedEvent { token_id, old_recipient: old, new_recipient });
+        env.events().publish((symbol_short!("royalty"), token_id, old.clone(), new_recipient.clone()), RoyaltyRecipientUpdatedEvent { token_id, old_recipient: old, new_recipient });
         Ok(())
     }
 
@@ -631,7 +681,7 @@ impl ClipsNftContract {
             cum_amt = total;
             if amount > 0 {
                 client.transfer(&payer, &split.recipient, &amount);
-                env.events().publish((symbol_short!("royalty"),), RoyaltyPaidEvent { token_id, from: payer.clone(), to: split.recipient, amount });
+                env.events().publish((symbol_short!("royalty"), token_id, split.recipient.clone()), RoyaltyPaidEvent { token_id, from: payer.clone(), to: split.recipient, amount });
             }
         }
         Self::release_reentrancy_lock(&env);
@@ -650,7 +700,7 @@ impl ClipsNftContract {
         env.storage().persistent().remove(&DataKey::RoyaltyBalance(token_id));
         soroban_sdk::token::TokenClient::new(&env, &asset).transfer(&env.current_contract_address(), &recipient, &balance);
         Self::release_reentrancy_lock(&env);
-        env.events().publish((symbol_short!("roy_clm"),), RoyaltyClaimedEvent { token_id, recipient, amount: balance, asset });
+        env.events().publish((symbol_short!("roy_clm"), token_id, recipient.clone()), RoyaltyClaimedEvent { token_id, recipient, amount: balance, asset });
         Ok(())
     }
 
@@ -674,7 +724,7 @@ impl ClipsNftContract {
         let active_at = env.ledger().timestamp().saturating_add(86_400);
         env.storage().instance().set(&DataKey::PauseUnlockTime, &active_at);
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish((symbol_short!("pse_sched"),), PauseScheduledEvent { active_at });
+        env.events().publish((symbol_short!("pse_sched"), symbol_short!("pause")), PauseScheduledEvent { active_at });
         Ok(())
     }
 
@@ -682,7 +732,7 @@ impl ClipsNftContract {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().remove(&DataKey::PauseUnlockTime);
-        env.events().publish((symbol_short!("unpaused"),), ());
+        env.events().publish((symbol_short!("unpaused"), admin.clone()), UnpausedEvent {});
         Ok(())
     }
 
@@ -693,19 +743,21 @@ impl ClipsNftContract {
     pub fn pause_minting(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::MintingPaused, &true);
+        env.events().publish((symbol_short!("pause_mint"), admin.clone()), PauseMintingEvent {});
         Ok(())
     }
 
     pub fn unpause_minting(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::MintingPaused, &false);
+        env.events().publish((symbol_short!("unpause_mint"), admin.clone()), UnpauseMintingEvent {});
         Ok(())
     }
 
     pub fn set_signer(env: Env, admin: Address, pubkey: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::Signer, &pubkey);
-        env.events().publish((symbol_short!("sgn_upd"),), SignerUpdatedEvent { new_pubkey: pubkey });
+        env.events().publish((symbol_short!("sgn_upd"), pubkey.clone()), SignerUpdatedEvent { new_pubkey: pubkey });
         Ok(())
     }
 
@@ -716,6 +768,7 @@ impl ClipsNftContract {
     pub fn set_backend_address(env: Env, admin: Address, backend_address: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::BackendAddress, &backend_address);
+        env.events().publish((symbol_short!("backend_upd"), backend_address.clone()), BackendAddressUpdatedEvent { new_backend_address: backend_address });
         Ok(())
     }
 
@@ -726,12 +779,14 @@ impl ClipsNftContract {
     pub fn set_platform_recipient(env: Env, admin: Address, recipient: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::PlatformRecipient, &recipient);
+        env.events().publish((symbol_short!("platform_recipient_upd"), recipient.clone()), PlatformRecipientUpdatedEvent { new_recipient: recipient });
         Ok(())
     }
 
     pub fn set_default_royalty_asset(env: Env, admin: Address, asset_address: Option<Address>) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::DefaultRoyaltyAsset, &asset_address);
+        env.events().publish((symbol_short!("default_royalty_asset_upd"),), DefaultRoyaltyAssetUpdatedEvent { asset_address });
         Ok(())
     }
 
@@ -742,6 +797,7 @@ impl ClipsNftContract {
     pub fn set_mint_cooldown(env: Env, admin: Address, seconds: u64) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::MintCooldownSeconds, &seconds);
+        env.events().publish((symbol_short!("cfg_upd"), symbol_short!("mint_cooldown")), ConfigUpdatedEvent { key: String::from_str(&env, "mint_cooldown"), new_value: seconds as i128 });
         Ok(())
     }
 
@@ -752,7 +808,7 @@ impl ClipsNftContract {
     pub fn blacklist_clip(env: Env, admin: Address, clip_id: u32) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().persistent().set(&DataKey::BlacklistedClip(clip_id), &true);
-        env.events().publish((symbol_short!("blacklist"),), BlacklistEvent { clip_id });
+        env.events().publish((symbol_short!("blacklist"), clip_id), BlacklistEvent { clip_id });
         Ok(())
     }
 
@@ -760,7 +816,7 @@ impl ClipsNftContract {
         Self::require_admin(&env, &admin)?;
         if !env.storage().persistent().has(&DataKey::Token(token_id)) { return Err(Error::InvalidTokenId); }
         env.storage().persistent().set(&DataKey::Frozen(token_id), &true);
-        env.events().publish((symbol_short!("freeze"),), TokenFrozenEvent { token_id });
+        env.events().publish((symbol_short!("freeze"), token_id), TokenFrozenEvent { token_id });
         Ok(())
     }
 
@@ -864,7 +920,7 @@ impl ClipsNftContract {
         Self::mark_signature_used(&env, &message_hash);
 
         env.events().publish(
-            (symbol_short!("mint"),),
+            (symbol_short!("mint"), token_id, to.clone()),
             MintEvent {
                 to: to.clone(),
                 clip_id,
@@ -874,7 +930,7 @@ impl ClipsNftContract {
         );
 
         env.events().publish(
-            (symbol_short!("transfer"),),
+            (symbol_short!("transfer"), token_id, env.current_contract_address(), to.clone()),
             TransferEvent {
                 token_id,
                 from: env.current_contract_address(),
@@ -958,12 +1014,12 @@ impl ClipsNftContract {
         env.storage().persistent().set(&DataKey::Balance(to.clone()), &(balance + 1));
 
         env.events().publish(
-            (symbol_short!("mint"),),
+            (symbol_short!("mint"), token_id, to.clone()),
             MintEvent { to: to.clone(), clip_id, token_id, metadata_uri: metadata_uri.clone() },
         );
 
         env.events().publish(
-            (symbol_short!("transfer"),),
+            (symbol_short!("transfer"), token_id, env.current_contract_address(), to.clone()),
             TransferEvent {
                 token_id,
                 from: env.current_contract_address(),
@@ -1045,7 +1101,7 @@ impl ClipsNftContract {
         let data = Self::load_token(&env, token_id)?;
         if data.owner != owner { return Err(Error::Unauthorized); }
         env.storage().persistent().set(&DataKey::CustomTokenUri(token_id), &new_uri.clone());
-        env.events().publish((symbol_short!("uri_chg"),), TokenUriChangedEvent { token_id, owner, new_uri });
+        env.events().publish((symbol_short!("uri_chg"), token_id, owner.clone()), TokenUriChangedEvent { token_id, owner, new_uri });
         Ok(())
     }
 
@@ -1053,7 +1109,7 @@ impl ClipsNftContract {
         Self::require_admin(&env, &admin)?;
         let unlock_time = env.ledger().timestamp().saturating_add(172_800);
         env.storage().instance().set(&DataKey::WithdrawXlmRequest, &WithdrawRequest { amount, unlock_time });
-        env.events().publish((symbol_short!("wdraw_req"),), WithdrawRequestedEvent { amount, unlock_time });
+        env.events().publish((symbol_short!("wdraw_req"), admin.clone()), WithdrawRequestedEvent { amount, unlock_time });
         Ok(())
     }
 
@@ -1064,25 +1120,28 @@ impl ClipsNftContract {
         env.storage().instance().remove(&DataKey::WithdrawXlmRequest);
         env.storage().instance().set(&DataKey::LastWithdrawalTime, &env.ledger().timestamp());
         soroban_sdk::token::TokenClient::new(&env, &asset).transfer(&env.current_contract_address(), &admin, &amount);
-        env.events().publish((symbol_short!("wdraw_exe"),), WithdrawExecutedEvent { amount, recipient: admin });
+        env.events().publish((symbol_short!("wdraw_exe"), admin.clone()), WithdrawExecutedEvent { amount, recipient: admin });
         Ok(())
     }
 
     pub fn set_circuit_breaker_enabled(env: Env, admin: Address, enabled: bool) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::CircuitBreakerEnabled, &enabled);
+        env.events().publish((symbol_short!("cfg_upd"), symbol_short!("circuit_enabled")), ConfigUpdatedEvent { key: String::from_str(&env, "circuit_enabled"), new_value: if enabled { 1 } else { 0 } });
         Ok(())
     }
 
     pub fn set_circuit_breaker_threshold(env: Env, admin: Address, threshold: u64) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::CircuitBreakerThreshold, &threshold);
+        env.events().publish((symbol_short!("cfg_upd"), symbol_short!("circuit_threshold")), ConfigUpdatedEvent { key: String::from_str(&env, "circuit_threshold"), new_value: threshold as i128 });
         Ok(())
     }
 
     pub fn set_circuit_breaker_window(env: Env, admin: Address, window_seconds: u64) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::CircuitBreakerWindowSeconds, &window_seconds);
+        env.events().publish((symbol_short!("cfg_upd"), symbol_short!("circuit_window")), ConfigUpdatedEvent { key: String::from_str(&env, "circuit_window"), new_value: window_seconds as i128 });
         Ok(())
     }
 
@@ -1090,6 +1149,7 @@ impl ClipsNftContract {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::CircuitBreakerWindowStart, &0u64);
         env.storage().instance().set(&DataKey::CircuitBreakerWindowCount, &0u64);
+        env.events().publish((symbol_short!("circuit_reset"), admin.clone()), CircuitBreakerResetEvent {});
         Ok(())
     }
 
@@ -1150,7 +1210,7 @@ impl ClipsNftContract {
         Self::record_mint_timestamp(&env, &to);
         Self::update_circuit_breaker_counter(&env, n as u64);
         let first = minted.get(0).unwrap_or(0);
-        env.events().publish((symbol_short!("batch_mnt"),), BatchMintEvent { to, count: n, first_token_id: first });
+        env.events().publish((symbol_short!("batch_mnt"), first), BatchMintEvent { to, count: n, first_token_id: first });
         Ok(minted)
     }
 
@@ -3597,7 +3657,7 @@ mod tests {
         if let Some(anim) = animation_url { data.animation_url = if anim.is_empty() { None } else { Some(anim) }; }
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
         env.storage().persistent().set(&DataKey::MetadataRefreshTime(token_id), &now);
-        env.events().publish((symbol_short!("meta_upd"),), MetadataUpdatedEvent { token_id, old_uri, new_uri: data.metadata_uri });
+        env.events().publish((symbol_short!("meta_upd"), token_id), MetadataUpdatedEvent { token_id, old_uri, new_uri: data.metadata_uri });
         Ok(())
     }
 
@@ -3608,7 +3668,7 @@ mod tests {
         if data.is_locked { return Err(Error::MetadataLocked); }
         data.is_locked = true;
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
-        env.events().publish((symbol_short!("meta_lock"),), MetadataLockedEvent { token_id, owner });
+        env.events().publish((symbol_short!("meta_lock"), token_id), MetadataLockedEvent { token_id, owner });
         Ok(())
     }
 
@@ -3819,7 +3879,7 @@ mod tests {
         let count = if in_window { wc.saturating_add(mint_count) } else { mint_count };
         if count > threshold {
             env.storage().instance().set(&DataKey::Paused, &true);
-            env.events().publish((symbol_short!("circuit"),), CircuitBreakerTriggeredEvent { mint_count: count, threshold, window_seconds: window });
+            env.events().publish((symbol_short!("circuit"), threshold), CircuitBreakerTriggeredEvent { mint_count: count, threshold, window_seconds: window });
             return Err(Error::CircuitBreakerTripped);
         }
         Ok(())
