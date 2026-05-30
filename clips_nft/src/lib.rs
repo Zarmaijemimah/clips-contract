@@ -113,6 +113,8 @@ pub enum Error {
     ClipBlacklisted = 13,
     /// Caller is not authorized to approve
     NotAuthorizedToApprove = 14,
+    /// Wallet address is blacklisted
+    WalletBlacklisted = 15,
 }
 
 /// Token ID type
@@ -205,10 +207,14 @@ pub enum DataKey {
     Symbol,
     /// Blacklisted clip IDs (persistent storage)
     BlacklistedClip(u32),
+    /// Blacklisted wallet addresses (persistent storage)
+    BlacklistedWallet(Address),
     /// Per-token operator approval (persistent storage)
     Approved(TokenId),
-    /// Operator approvals across all owner tokens (persistent storage)
-    ApprovalForAll(Address, Address),
+    /// Operator approvals across all owner tokens (persistent storage).
+    /// Key is SHA-256(owner_xdr || operator_xdr) — compact 32-byte form
+    /// instead of storing two full addresses, halving the ledger footprint.
+    ApprovalForAll(BytesN<32>),
     /// Total platform royalty revenue collected (instance storage)
     TotalPlatformFees,
 }
@@ -248,6 +254,20 @@ pub struct TransferEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlacklistEvent {
     pub clip_id: u32,
+}
+
+/// Event emitted when a wallet address is blacklisted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletBlacklistEvent {
+    pub wallet: Address,
+}
+
+/// Event emitted when a wallet address is removed from the blacklist.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletUnblacklistEvent {
+    pub wallet: Address,
 }
 
 /// Event emitted when token approval is updated.
@@ -398,6 +418,50 @@ impl ClipsNftContract {
         Ok(())
     }
 
+    /// Blacklist a wallet address, preventing it from minting or receiving transfers.
+    /// Only callable by the admin.
+    ///
+    /// Emits: `"bl_wallet"` [`WalletBlacklistEvent`].
+    ///
+    /// # Arguments
+    /// * `admin`  — Must be the contract admin.
+    /// * `wallet` — Address to blacklist.
+    pub fn blacklist_wallet(env: Env, admin: Address, wallet: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::BlacklistedWallet(wallet.clone()), &true);
+        env.events()
+            .publish((symbol_short!("bl_wlt"),), WalletBlacklistEvent { wallet });
+        Ok(())
+    }
+
+    /// Remove a wallet address from the blacklist.
+    /// Only callable by the admin.
+    ///
+    /// Emits: `"ubl_wlt"` [`WalletUnblacklistEvent`].
+    ///
+    /// # Arguments
+    /// * `admin`  — Must be the contract admin.
+    /// * `wallet` — Address to unblacklist.
+    pub fn unblacklist_wallet(env: Env, admin: Address, wallet: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BlacklistedWallet(wallet.clone()));
+        env.events()
+            .publish((symbol_short!("ubl_wlt"),), WalletUnblacklistEvent { wallet });
+        Ok(())
+    }
+
+    /// Returns `true` if `wallet` is currently blacklisted.
+    pub fn is_wallet_blacklisted(env: Env, wallet: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::BlacklistedWallet(wallet))
+            .unwrap_or(false)
+    }
+
     fn emit_mint_event(
         env: &Env,
         token_id: TokenId,
@@ -515,6 +579,14 @@ impl ClipsNftContract {
     ) -> Result<TokenId, Error> {
         Self::require_clip_owner(&to);
         Self::require_not_paused(&env)?;
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::BlacklistedWallet(to.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::WalletBlacklisted);
+        }
         if env.storage().instance().get::<DataKey, bool>(&DataKey::MintingPaused).unwrap_or(false) {
             return Err(Error::MintingPaused);
         }
@@ -703,9 +775,10 @@ impl ClipsNftContract {
         caller.require_auth();
         Self::require_not_paused(&env)?;
 
+        let key = Self::approval_for_all_key(&env, &caller, &operator);
         env.storage()
             .persistent()
-            .set(&DataKey::ApprovalForAll(caller.clone(), operator.clone()), &approved);
+            .set(&key, &approved);
 
         env.events().publish(
             (symbol_short!("appr_all"),),
@@ -719,7 +792,8 @@ impl ClipsNftContract {
         caller.require_auth();
         let data: TokenData = Self::load_token(&env, token_id)?;
         if data.owner != caller {
-            let approved_all = env.storage().persistent().get::<DataKey, bool>(&DataKey::ApprovalForAll(data.owner.clone(), caller.clone())).unwrap_or(false);
+            let afall_key = Self::approval_for_all_key(&env, &data.owner, &caller);
+            let approved_all = env.storage().persistent().get::<DataKey, bool>(&afall_key).unwrap_or(false);
             if !approved_all { return Err(Error::Unauthorized); }
         }
         match operator {
@@ -734,7 +808,8 @@ impl ClipsNftContract {
 
     pub fn set_approval_for_all(env: Env, caller: Address, operator: Address, approved: bool) -> Result<(), Error> {
         caller.require_auth();
-        env.storage().persistent().set(&DataKey::ApprovalForAll(caller.clone(), operator.clone()), &approved);
+        let key = Self::approval_for_all_key(&env, &caller, &operator);
+        env.storage().persistent().set(&key, &approved);
         env.events().publish((symbol_short!("app_all"), caller.clone(), operator.clone()), ApprovalForAllEvent { owner: caller, operator, approved });
         Ok(())
     }
@@ -744,7 +819,8 @@ impl ClipsNftContract {
     }
 
     pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
-        env.storage().persistent().get::<DataKey, bool>(&DataKey::ApprovalForAll(owner, operator)).unwrap_or(false)
+        let key = Self::approval_for_all_key(&env, &owner, &operator);
+        env.storage().persistent().get::<DataKey, bool>(&key).unwrap_or(false)
     }
 
     // -------------------------------------------------------------------------
@@ -1069,9 +1145,8 @@ impl ClipsNftContract {
     // Task 4: revoke all operator approvals for the caller
     pub fn revoke_all_approvals(env: Env, caller: Address, operator: Address) -> Result<(), Error> {
         caller.require_auth();
-        env.storage()
-            .persistent()
-            .remove(&DataKey::ApprovalForAll(caller.clone(), operator.clone()));
+        let key = Self::approval_for_all_key(&env, &caller, &operator);
+        env.storage().persistent().remove(&key);
         env.events().publish(
             (symbol_short!("app_all"), caller.clone(), operator.clone()),
             ApprovalForAllEvent { owner: caller, operator, approved: false },
@@ -2165,7 +2240,8 @@ impl ClipsNftContract {
     }
 
     pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
-        env.storage().persistent().get::<DataKey, bool>(&DataKey::ApprovalForAll(owner, operator)).unwrap_or(false)
+        let key = Self::approval_for_all_key(&env, &owner, &operator);
+        env.storage().persistent().get::<DataKey, bool>(&key).unwrap_or(false)
     }
 
     // -------------------------------------------------------------------------
@@ -2384,9 +2460,8 @@ impl ClipsNftContract {
     // Task 4: revoke all operator approvals for the caller
     pub fn revoke_all_approvals(env: Env, caller: Address, operator: Address) -> Result<(), Error> {
         caller.require_auth();
-        env.storage()
-            .persistent()
-            .remove(&DataKey::ApprovalForAll(caller.clone(), operator.clone()));
+        let key = Self::approval_for_all_key(&env, &caller, &operator);
+        env.storage().persistent().remove(&key);
         env.events().publish(
             (symbol_short!("app_all"), caller.clone(), operator.clone()),
             ApprovalForAllEvent { owner: caller, operator, approved: false },
@@ -3396,6 +3471,23 @@ impl ClipsNftContract {
         from.require_auth();
         Self::require_not_paused(&env)?;
 
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::BlacklistedWallet(from.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::WalletBlacklisted);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::BlacklistedWallet(to.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::WalletBlacklisted);
+        }
+
         // 1 persistent read
         let mut data: TokenData = env
             .storage()
@@ -3961,6 +4053,21 @@ impl ClipsNftContract {
         }
         let amount = sale_price.saturating_mul(basis_points as i128);
         Ok((amount.saturating_add(5_000)) / 10_000)
+    }
+
+    /// Build the compact `ApprovalForAll` storage key.
+    ///
+    /// Hashing both addresses into a single 32-byte key cuts the ledger-entry
+    /// key size from ~72 bytes (two raw Addresses in XDR) down to 32 bytes,
+    /// roughly halving the per-entry overhead for operator approvals.
+    ///
+    /// Collision probability is negligible (SHA-256 second-preimage resistance).
+    fn approval_for_all_key(env: &Env, owner: &Address, operator: &Address) -> DataKey {
+        use soroban_sdk::xdr::ToXdr;
+        let mut preimage = Bytes::new(env);
+        preimage.append(&Bytes::from(owner.clone().to_xdr(env)));
+        preimage.append(&Bytes::from(operator.clone().to_xdr(env)));
+        DataKey::ApprovalForAll(env.crypto().sha256(&preimage).into())
     }
 }
 
