@@ -55,6 +55,9 @@ pub enum Error {
     MintingPaused = 25,
     CircuitBreakerTripped = 26,
     MetadataLocked = 27,
+    MaxSupplyReached = 28,
+    InvalidMaxSupply = 29,
+    InvalidRecoverAmount = 30,
 }
 
 // =============================================================================
@@ -150,6 +153,7 @@ pub enum DataKey {
     MintCooldownSeconds,
     ReentrancyLock,
     TotalSupply,
+    MaxSupply,
     ContractVersion,
     CircuitBreakerEnabled,
     CircuitBreakerThreshold,
@@ -404,6 +408,7 @@ impl ClipsNftContract {
         env.storage().instance().set(&DataKey::CircuitBreakerWindowSeconds, &DEFAULT_CIRCUIT_BREAKER_WINDOW_SECONDS);
         env.storage().instance().set(&DataKey::CircuitBreakerWindowStart, &0u64);
         env.storage().instance().set(&DataKey::CircuitBreakerWindowCount, &0u64);
+        env.storage().instance().set(&DataKey::MaxSupply, &Option::<u32>::None);
         env.storage().instance().set(&DataKey::BackendAddress, &admin);
     }
 
@@ -548,6 +553,31 @@ impl ClipsNftContract {
         env.storage().instance().get(&DataKey::PendingOwner)
     }
 
+    /// Set or clear the global maximum supply cap for mintable NFTs.
+    ///
+    /// Passing `None` removes the cap.
+    pub fn set_max_supply(env: Env, admin: Address, max_supply: Option<u32>) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if let Some(max_supply) = max_supply {
+            let supply: u32 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
+            if max_supply < supply {
+                return Err(Error::InvalidMaxSupply);
+            }
+        }
+        env.storage().instance().set(&DataKey::MaxSupply, &max_supply);
+        Ok(())
+    }
+
+    pub fn max_supply(env: Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::MaxSupply).unwrap_or(None)
+    }
+
+    pub fn remaining_supply(env: Env) -> Option<u32> {
+        let max_supply: Option<u32> = env.storage().instance().get(&DataKey::MaxSupply).unwrap_or(None);
+        let supply: u32 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
+        max_supply.map(|cap| cap.saturating_sub(supply))
+    }
+
     // -------------------------------------------------------------------------
     // Task 1: Safe math — mint with overflow-safe royalty validation
     // -------------------------------------------------------------------------
@@ -561,9 +591,13 @@ impl ClipsNftContract {
         animation_url: Option<String>,
         royalty: Royalty,
         is_soulbound: bool,
+        fee_payer: Option<Address>,
         signature: BytesN<64>,
     ) -> Result<TokenId, Error> {
         to.require_auth();
+        if let Some(fee_payer) = fee_payer.clone() {
+            fee_payer.require_auth();
+        }
         Self::require_not_paused(&env)?;
         if env
             .storage()
@@ -578,6 +612,12 @@ impl ClipsNftContract {
         }
         Self::enforce_mint_cooldown(&env, &to)?;
         Self::check_circuit_breaker(&env, 1)?;
+        let current_supply: u32 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
+        if let Some(max_supply) = env.storage().instance().get::<DataKey, Option<u32>>(&DataKey::MaxSupply).unwrap_or(None) {
+            if current_supply >= max_supply {
+                return Err(Error::MaxSupplyReached);
+            }
+        }
         Self::validate_url(&env, &image)?;
         Self::validate_url(&env, &animation_url)?;
         Self::verify_clip_signature(&env, &to, clip_id, &metadata_uri, &signature)?;
@@ -1330,6 +1370,15 @@ impl ClipsNftContract {
         env.storage().instance().set(&DataKey::LastWithdrawalTime, &env.ledger().timestamp());
         soroban_sdk::token::TokenClient::new(&env, &asset).transfer(&env.current_contract_address(), &admin, &amount);
         env.events().publish((symbol_short!("wdraw_exe"), admin.clone()), WithdrawExecutedEvent { amount, recipient: admin });
+        Ok(())
+    }
+
+    pub fn recover_token(env: Env, admin: Address, asset: Address, amount: i128) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if amount <= 0 {
+            return Err(Error::InvalidRecoverAmount);
+        }
+        soroban_sdk::token::TokenClient::new(&env, &asset).transfer(&env.current_contract_address(), &admin, &amount);
         Ok(())
     }
 
@@ -2538,6 +2587,15 @@ impl ClipsNftContract {
         Ok(())
     }
 
+    pub fn recover_token(env: Env, admin: Address, asset: Address, amount: i128) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if amount <= 0 {
+            return Err(Error::InvalidRecoverAmount);
+        }
+        soroban_sdk::token::TokenClient::new(&env, &asset).transfer(&env.current_contract_address(), &admin, &amount);
+        Ok(())
+    }
+
     pub fn withdraw_xlm(env: Env, admin: Address, xlm_address: Address, amount: i128) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         if let Some(req) = env.storage().instance().get::<_, WithdrawRequest>(&DataKey::WithdrawXlmRequest) {
@@ -2980,6 +3038,47 @@ impl ClipsNftContract {
             .map(|last| last.saturating_add(COOLDOWN))
             .unwrap_or(0);
         Ok(next_time)
+    }
+
+    // -------------------------------------------------------------------------
+    // Core NFT operations
+    // -------------------------------------------------------------------------
+
+    /// Mint a new NFT for a video clip.
+    ///
+    /// Requires a valid Ed25519 `signature` from the registered backend signer
+    /// over the canonical mint payload, proving the clip exists and belongs to
+    /// `to`. The payload is:
+    ///
+    /// ```text
+    /// payload = SHA-256(
+    ///     clip_id_le_4_bytes
+    ///     || SHA-256(owner_address_xdr)   // 32 bytes
+    ///     || SHA-256(metadata_uri_bytes)  // 32 bytes
+    /// )
+    /// ```
+    ///
+    /// Storage writes (persistent): TokenData, Metadata, Royalty, ClipIdMinted = **4**
+    /// Instance writes: NextTokenId = **1**
+    ///
+    /// # Arguments
+    /// * `to`           - Address that will own the NFT (must match the signed payload)
+    /// * `clip_id`      - Unique off-chain clip identifier (must match the signed payload)
+    /// * `metadata_uri` - IPFS or Arweave URI (must match the signed payload)
+    /// * `royalty`      - Royalty configuration
+    /// * `is_soulbound` - Whether the token is soulbound (non-transferable)
+    /// * `signature`    - 64-byte Ed25519 signature from the backend signer
+    pub fn mint(
+        env: Env,
+        payer: Address,
+        token_id: TokenId,
+        sale_price: i128,
+    ) -> Result<(), Error> {
+        payer.require_auth();
+        Self::acquire_reentrancy_lock(&env)?;
+        let result = Self::pay_royalty_internal(&env, &payer, token_id, sale_price);
+        Self::release_reentrancy_lock(&env);
+        result
     }
 
     // -------------------------------------------------------------------------
@@ -3459,7 +3558,7 @@ impl ClipsNftContract {
         let mut cumulative_royalty: i128 = 0;
         for idx in 0..royalty.recipients.len() {
             let split = royalty.recipients.get(idx).ok_or(Error::InvalidRoyaltySplit)?;
-            
+
             cumulative_bps = cumulative_bps.saturating_add(split.basis_points);
             let total_royalty_so_far = Self::calculate_royalty(sale_price, cumulative_bps)?;
             let amount = total_royalty_so_far.saturating_sub(cumulative_royalty);
@@ -3492,7 +3591,44 @@ impl ClipsNftContract {
             );
         }
 
+        // Track global and per-token royalties paid
+        if cumulative_royalty > 0 {
+            let global: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalRoyaltiesPaid)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalRoyaltiesPaid, &global.saturating_add(cumulative_royalty));
+
+            let per_token: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TokenRoyaltiesPaid(token_id))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::TokenRoyaltiesPaid(token_id), &per_token.saturating_add(cumulative_royalty));
+        }
+
         Ok(())
+    }
+
+    /// Returns the total royalties distributed across all tokens since contract deployment.
+    pub fn total_royalties_paid(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalRoyaltiesPaid)
+            .unwrap_or(0)
+    }
+
+    /// Returns the cumulative royalties paid for a specific token.
+    pub fn token_royalties_paid(env: Env, token_id: TokenId) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TokenRoyaltiesPaid(token_id))
+            .unwrap_or(0)
     }
 
     /// Update the royalty configuration for a token. Admin only.
