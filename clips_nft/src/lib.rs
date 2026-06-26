@@ -205,6 +205,8 @@ pub enum DataKey {
     UsedSignature(BytesN<32>),
     /// Issue #299: optional human-readable reason provided when pausing
     PauseReason,
+    /// Issue #473: wallet address that receives platform fees
+    TreasuryWallet,
 }
 
 // =============================================================================
@@ -906,6 +908,24 @@ impl ClipsNftContract {
 
     pub fn get_default_royalty_bps(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::DefaultRoyaltyBps).unwrap_or(0)
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #473: Treasury wallet configuration
+    // -------------------------------------------------------------------------
+
+    /// Set the treasury wallet address that receives platform fees.
+    /// Only callable by admin. The `wallet` must be a valid Stellar address
+    /// (enforced implicitly by the `Address` type).
+    pub fn set_treasury_wallet(env: Env, admin: Address, wallet: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::TreasuryWallet, &wallet);
+        Ok(())
+    }
+
+    /// Return the configured treasury wallet, or `None` if not yet set.
+    pub fn get_treasury_wallet(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TreasuryWallet)
     }
 
     // -------------------------------------------------------------------------
