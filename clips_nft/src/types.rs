@@ -61,4 +61,5 @@ pub enum Error {
     SignerNotSet = 8,
     InvalidSignature = 9,
     InvalidBasisPoints = 10,
+    InvalidConfig = 11,
 }

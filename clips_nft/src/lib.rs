@@ -11,7 +11,7 @@ mod default_royalty;
 mod platform_fee;
 mod types;
 
-pub use config::{get_config, set_config, Config, CONTRACT_VERSION};
+pub use config::{get_config, set_config, Config, ConfigService, ConfigUpdateEvent, CONTRACT_VERSION, MAX_BATCH_MINT_SIZE, MAX_COLLECTION_SIZE};
 pub use default_royalty::{
     get_default_royalty_bps, set_default_royalty_bps, DEFAULT_ROYALTY_BPS, MAX_ROYALTY_BPS,
 };
@@ -47,12 +47,76 @@ impl ClipCashNFT {
     pub fn set_config(env: Env, admin: Address, cfg: Config) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         admin.require_auth();
-        config::set_config(&env, cfg)
+        config::set_config(&env, cfg, admin)
     }
 
     /// Return the current [`Config`], or `None` before initialization.
     pub fn get_config(env: Env) -> Option<Config> {
         config::get_config(&env)
+    }
+
+    /// Return max batch mint size (defaults to MAX_BATCH_MINT_SIZE if config not set).
+    pub fn get_max_batch_mint_size(env: Env) -> u32 {
+        config::get_config(&env)
+            .map(|c| c.max_batch_mint_size)
+            .unwrap_or(MAX_BATCH_MINT_SIZE)
+    }
+
+    /// Set max batch mint size (1–100). Admin only.
+    pub fn set_max_batch_mint_size(env: Env, admin: Address, value: u32) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        if value < 1 || value > 100 {
+            return Err(Error::InvalidConfig);
+        }
+        let mut cfg = config::get_config(&env).ok_or(Error::NotInitialized)?;
+        let old = cfg.max_batch_mint_size;
+        cfg.max_batch_mint_size = value;
+        if old != value {
+            env.events().publish(
+                ("config_update",),
+                config::ConfigUpdateEvent {
+                    key: soroban_sdk::String::from_str(&env, "max_batch_mint_size"),
+                    old_value: old,
+                    new_value: value,
+                    updater: admin.clone(),
+                },
+            );
+        }
+        env.storage().instance().set(&DataKey::Config, &cfg);
+        Ok(())
+    }
+
+    /// Return max collection size (defaults to MAX_COLLECTION_SIZE if config not set).
+    pub fn get_max_collection_size(env: Env) -> u32 {
+        config::get_config(&env)
+            .map(|c| c.max_collection_size)
+            .unwrap_or(MAX_COLLECTION_SIZE)
+    }
+
+    /// Set max collection size (1–100 000). Admin only.
+    pub fn set_max_collection_size(env: Env, admin: Address, value: u32) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        if value < 1 || value > 100_000 {
+            return Err(Error::InvalidConfig);
+        }
+        let mut cfg = config::get_config(&env).ok_or(Error::NotInitialized)?;
+        let old = cfg.max_collection_size;
+        cfg.max_collection_size = value;
+        if old != value {
+            env.events().publish(
+                ("config_update",),
+                config::ConfigUpdateEvent {
+                    key: soroban_sdk::String::from_str(&env, "max_collection_size"),
+                    old_value: old,
+                    new_value: value,
+                    updater: admin.clone(),
+                },
+            );
+        }
+        env.storage().instance().set(&DataKey::Config, &cfg);
+        Ok(())
     }
 
     // ─── Default Royalty ─────────────────────────────────────────────────────
