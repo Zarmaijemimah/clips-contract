@@ -6,10 +6,12 @@
 
 #![no_std]
 
+mod config;
 mod default_royalty;
 mod platform_fee;
 mod types;
 
+pub use config::{get_config, set_config, Config, CONTRACT_VERSION};
 pub use default_royalty::{
     get_default_royalty_bps, set_default_royalty_bps, DEFAULT_ROYALTY_BPS, MAX_ROYALTY_BPS,
 };
@@ -37,6 +39,20 @@ impl ClipCashNFT {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextTokenId, &0u32);
         env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    // ─── Config ───────────────────────────────────────────────────────────────
+
+    /// Persist a full [`Config`] snapshot. Admin only.
+    pub fn set_config(env: Env, admin: Address, cfg: Config) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        config::set_config(&env, cfg)
+    }
+
+    /// Return the current [`Config`], or `None` before initialization.
+    pub fn get_config(env: Env) -> Option<Config> {
+        config::get_config(&env)
     }
 
     // ─── Default Royalty ─────────────────────────────────────────────────────

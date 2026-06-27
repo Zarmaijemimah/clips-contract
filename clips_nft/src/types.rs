@@ -46,6 +46,7 @@ pub enum DataKey {
     ClipIdMinted(u32),
     PlatformFee,
     DefaultRoyaltyBps,
+    Config,
 }
 
 #[contracttype]
