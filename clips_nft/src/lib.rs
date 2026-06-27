@@ -16,7 +16,7 @@ pub use default_royalty::{
     get_default_royalty_bps, set_default_royalty_bps, DEFAULT_ROYALTY_BPS, MAX_ROYALTY_BPS,
 };
 pub use platform_fee::{get_platform_fee, set_platform_fee, MAX_PLATFORM_FEE_BPS};
-pub use types::{DataKey, Error, MintEvent, Royalty, RoyaltyInfo, TokenData, TokenId};
+pub use types::{DataKey, Error, MintEvent, Royalty, RoyaltyInfo, TokenData, TokenId, TransferEvent};
 
 use soroban_sdk::{
     contract, contractimpl, BytesN, Env, String,
@@ -197,8 +197,9 @@ impl ClipCashNFT {
         if data.owner != from {
             return Err(Error::Unauthorized);
         }
-        data.owner = to;
+        data.owner = to.clone();
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
+        env.events().publish(("transfer",), TransferEvent { from, to, token_id });
         Ok(())
     }
 
