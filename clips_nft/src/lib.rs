@@ -298,8 +298,9 @@ impl ClipCashNFT {
         if data.owner != from {
             return Err(Error::Unauthorized);
         }
-        data.owner = to;
+        data.owner = to.clone();
         env.storage().persistent().set(&DataKey::Token(token_id), &data);
+        env.events().publish(("transfer",), TransferEvent { from, to, token_id });
         Ok(())
     }
 
