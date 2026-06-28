@@ -286,6 +286,7 @@ impl ClipCashNFT {
         to: Address,
         token_id: TokenId,
     ) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
         from.require_auth();
         Self::require_not_paused(&env)?;
         let mut data = token_storage::get_token(&env, token_id)?;
@@ -300,6 +301,7 @@ impl ClipCashNFT {
 
     /// Burn an NFT. Only the current owner may burn.
     pub fn burn(env: Env, owner: Address, token_id: TokenId) -> Result<(), Error> {
+        Self::require_initialized(&env)?;
         owner.require_auth();
         let data = token_storage::get_token(&env, token_id)?;
         if data.owner != owner {
