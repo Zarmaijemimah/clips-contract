@@ -1,8 +1,7 @@
-use soroban_sdk::{contracttype, Address, String};
+use soroban_sdk::{contracterror, contracttype, Address, String};
 
 pub type TokenId = u32;
 
-/// Packed token ownership data stored per token.
 #[contracttype]
 #[derive(Clone)]
 pub struct TokenData {
@@ -10,17 +9,14 @@ pub struct TokenData {
     pub clip_id: u32,
 }
 
-/// Royalty configuration for a token.
 #[contracttype]
 #[derive(Clone)]
 pub struct Royalty {
     pub recipient: Address,
-    /// 0 – 10_000 (basis points, i.e. 0%–100%)
     pub basis_points: u32,
     pub asset_address: Option<Address>,
 }
 
-/// Royalty payment breakdown returned by `royalty_info`.
 #[contracttype]
 #[derive(Clone)]
 pub struct RoyaltyInfo {
@@ -29,7 +25,6 @@ pub struct RoyaltyInfo {
     pub asset_address: Option<Address>,
 }
 
-/// Minted-event data.
 #[contracttype]
 #[derive(Clone)]
 pub struct MintEvent {
@@ -39,17 +34,70 @@ pub struct MintEvent {
     pub metadata_uri: String,
 }
 
-/// Global contract configuration.
-///
-/// Stored once in instance storage under [`StorageKey::Config`].
 #[contracttype]
 #[derive(Clone)]
-pub struct Config {
-    pub admin: Address,
-    /// Maximum royalty in basis points (default 10_000 = 100%).
-    pub max_royalty_bps: u32,
-    /// Minimum seconds between mints per address (0 = no cooldown).
-    pub mint_cooldown_secs: u64,
-    /// Platform fee in basis points applied on top of creator royalty.
-    pub platform_fee_bps: u32,
+pub struct BurnEvent {
+    pub owner: Address,
+    pub token_id: TokenId,
+}
+
+#[contracttype]
+pub enum DataKey {
+    Admin,
+    NextTokenId,
+    Paused,
+    Signer,
+    Token(u32),
+    Metadata(u32),
+    Royalty(u32),
+    /// Maps clip_id → token_id; also used as existence marker for a minted clip.
+    ClipIdMinted(u32),
+    PlatformFee,
+    DefaultRoyaltyBps,
+    Config,
+    /// List of supported payment currency addresses.
+    SupportedCurrencies,
+    /// Blacklisted wallet address.
+    Blacklisted(Address),
+    /// Single-token approval: address approved to transfer token_id.
+    Approval(u32),
+    /// Operator approval: (owner, operator) → approved.
+    OperatorApproval(Address, Address),
+    /// Minted supply counter per collection.
+    CollectionSupply(u32),
+    /// Maps token_id → clip_id (reverse of ClipIdMinted).
+    TokenClipId(u32),
+    /// Existence marker for the minted-clip index (bool).
+    ClipMinted(u32),
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    ContractPaused = 4,
+    NotPaused = 5,
+    TokenNotFound = 6,
+    ClipAlreadyMinted = 7,
+    SignerNotSet = 8,
+    InvalidSignature = 9,
+    InvalidBasisPoints = 10,
+    // ── Configuration Errors (Issue #486) ────────────────────────────────
+    /// Fee value is outside the allowed range.
+    InvalidFee = 11,
+    /// Address is invalid or empty.
+    InvalidAddress = 12,
+    /// Metadata URI is empty or malformed.
+    InvalidURI = 13,
+    /// Collection limit is zero or exceeds the maximum.
+    InvalidLimit = 14,
+    /// Caller is not authorized to update configuration.
+    UnauthorizedConfigurationUpdate = 15,
+    /// Currency already exists in the supported list.
+    DuplicateCurrency = 16,
+    /// Currency not found in the supported list.
+    CurrencyNotFound = 17,
 }
