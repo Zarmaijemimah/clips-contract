@@ -7,13 +7,17 @@
 #![no_std]
 
 mod blacklist;
+mod clip_id_storage;
 mod config;
 mod config_guard;
 mod config_validator;
 mod default_royalty;
+mod minted_clip_index;
 mod payment_currency;
 mod platform_fee;
+mod royalty_storage;
 mod token_approval;
+mod token_metadata_storage;
 mod types;
 
 pub use blacklist::{add_wallet, is_blacklisted, remove_wallet};

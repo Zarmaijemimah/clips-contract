@@ -50,12 +50,25 @@ pub enum DataKey {
     Token(u32),
     Metadata(u32),
     Royalty(u32),
+    /// Maps clip_id → token_id; also used as existence marker for a minted clip.
     ClipIdMinted(u32),
     PlatformFee,
     DefaultRoyaltyBps,
     Config,
     /// List of supported payment currency addresses.
     SupportedCurrencies,
+    /// Blacklisted wallet address.
+    Blacklisted(Address),
+    /// Single-token approval: address approved to transfer token_id.
+    Approval(u32),
+    /// Operator approval: (owner, operator) → approved.
+    OperatorApproval(Address, Address),
+    /// Minted supply counter per collection.
+    CollectionSupply(u32),
+    /// Maps token_id → clip_id (reverse of ClipIdMinted).
+    TokenClipId(u32),
+    /// Existence marker for the minted-clip index (bool).
+    ClipMinted(u32),
 }
 
 #[contracterror]
