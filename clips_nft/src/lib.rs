@@ -70,6 +70,70 @@ impl ClipCashNFT {
         config::get_config(&env)
     }
 
+    /// Return max batch mint size (defaults to MAX_BATCH_MINT_SIZE if config not set).
+    pub fn get_max_batch_mint_size(env: Env) -> u32 {
+        config::get_config(&env)
+            .map(|c| c.max_batch_mint_size)
+            .unwrap_or(MAX_BATCH_MINT_SIZE)
+    }
+
+    /// Set max batch mint size (1–100). Admin only.
+    pub fn set_max_batch_mint_size(env: Env, admin: Address, value: u32) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        if value < 1 || value > 100 {
+            return Err(Error::InvalidConfig);
+        }
+        let mut cfg = config::get_config(&env).ok_or(Error::NotInitialized)?;
+        let old = cfg.max_batch_mint_size;
+        cfg.max_batch_mint_size = value;
+        if old != value {
+            env.events().publish(
+                ("config_update",),
+                config::ConfigUpdateEvent {
+                    key: soroban_sdk::String::from_str(&env, "max_batch_mint_size"),
+                    old_value: old,
+                    new_value: value,
+                    updater: admin.clone(),
+                },
+            );
+        }
+        env.storage().instance().set(&DataKey::Config, &cfg);
+        Ok(())
+    }
+
+    /// Return max collection size (defaults to MAX_COLLECTION_SIZE if config not set).
+    pub fn get_max_collection_size(env: Env) -> u32 {
+        config::get_config(&env)
+            .map(|c| c.max_collection_size)
+            .unwrap_or(MAX_COLLECTION_SIZE)
+    }
+
+    /// Set max collection size (1–100 000). Admin only.
+    pub fn set_max_collection_size(env: Env, admin: Address, value: u32) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        if value < 1 || value > 100_000 {
+            return Err(Error::InvalidConfig);
+        }
+        let mut cfg = config::get_config(&env).ok_or(Error::NotInitialized)?;
+        let old = cfg.max_collection_size;
+        cfg.max_collection_size = value;
+        if old != value {
+            env.events().publish(
+                ("config_update",),
+                config::ConfigUpdateEvent {
+                    key: soroban_sdk::String::from_str(&env, "max_collection_size"),
+                    old_value: old,
+                    new_value: value,
+                    updater: admin.clone(),
+                },
+            );
+        }
+        env.storage().instance().set(&DataKey::Config, &cfg);
+        Ok(())
+    }
+
     // ─── Default Royalty ─────────────────────────────────────────────────────
 
     /// Set the contract-wide default royalty in basis points (max 10 000 = 100 %).
